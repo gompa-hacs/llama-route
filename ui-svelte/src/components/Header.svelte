@@ -4,6 +4,7 @@
   import { currentRoute } from "../stores/route";
   import { playgroundActivity } from "../stores/playgroundActivity";
   import ConnectionStatus from "./ConnectionStatus.svelte";
+  import { adminRequired, logout } from "../stores/auth";
 
   function handleTitleChange(newTitle: string): void {
     const sanitized = newTitle.replace(/\n/g, "").trim().substring(0, 64) || "llama-swap";
@@ -94,6 +95,16 @@
     >
       Performance
     </a>
+    <a
+      href="/keys"
+      use:link
+      class="text-gray-600 hover:text-black dark:text-gray-300 dark:hover:text-gray-100 p-1 whitespace-nowrap"
+      class:font-semibold={isActive("/keys", $currentRoute)}
+      class:underline={isActive("/keys", $currentRoute)}
+      class:underline-offset-4={isActive("/keys", $currentRoute)}
+    >
+      API Keys
+    </a>
     <button onclick={toggleTheme} title="Toggle theme (current: {$themeMode})">
       {#if $themeMode === "system"}
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5">
@@ -117,6 +128,9 @@
       {/if}
     </button>
     <ConnectionStatus />
+    {#if $adminRequired}
+      <button class="text-sm text-gray-600 hover:underline dark:text-gray-300" type="button" onclick={() => logout()}>Logout</button>
+    {/if}
   </menu>
 </header>
 

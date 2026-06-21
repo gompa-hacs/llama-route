@@ -4,40 +4,66 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
-// CreateAuthMiddleware returns middleware that validates API keys when the
-// config declares any. It accepts the key via Authorization: Bearer,
-// Authorization: Basic (password field), or x-api-key. When no keys are
-// configured the middleware is a pass-through.
-func CreateAuthMiddleware(cfg config.Config) chain.Middleware {
-	keys := cfg.RequiredAPIKeys
+// CreateInferenceAuthMiddleware validates inference API keys when any are
+// configured (static YAML keys or UI-managed keys).
+func CreateInferenceAuthMiddleware(m *auth.Manager) chain.Middleware {
 	return func(next http.Handler) http.Handler {
-		if len(keys) == 0 {
+		if m == nil || !m.InferenceRequired() {
 			return next
 		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			provided := shared.ExtractAPIKey(r)
-
-			valid := false
-			for _, key := range keys {
-				if provided == key {
-					valid = true
-					break
-				}
+			if m.ValidateInferenceKey(shared.ExtractAPIKey(r)) {
+				next.ServeHTTP(w, r)
+				return
 			}
-			if !valid {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="llama-swap"`)
+			shared.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
+		})
+	}
+}
+
+// CreateAdminAuthMiddleware protects dashboard routes. When admin login is
+// configured, a valid session cookie is required (API keys also work). When
+// only inference keys are configured, those are required instead.
+func CreateAdminAuthMiddleware(m *auth.Manager) chain.Middleware {
+	return func(next http.Handler) http.Handler {
+		if m == nil {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if m.AdminRequired() {
+				if m.SessionValid(sessionToken(r)) || m.ValidateInferenceKey(shared.ExtractAPIKey(r)) {
+					next.ServeHTTP(w, r)
+					return
+				}
 				w.Header().Set("WWW-Authenticate", `Basic realm="llama-swap"`)
+				shared.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: admin login required")
+				return
+			}
+			if m.InferenceRequired() {
+				if m.ValidateInferenceKey(shared.ExtractAPIKey(r)) {
+					next.ServeHTTP(w, r)
+					return
+				}
+				w.Header().Set("WWW-Authenticate", `Bearer realm="llama-swap"`)
 				shared.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
 				return
 			}
-
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// CreateAuthMiddleware preserves backward compatibility for tests: inference key
+// check only.
+func CreateAuthMiddleware(m *auth.Manager) chain.Middleware {
+	return CreateInferenceAuthMiddleware(m)
 }
 
 // CreateRequestContextMiddleware returns middleware that extracts model and

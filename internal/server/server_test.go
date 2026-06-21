@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
@@ -59,6 +60,8 @@ func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	proxylog := logmon.NewWriter(io.Discard)
+	authMgr, _ := auth.NewManager(config.Config{})
+	pool, _ := router.NewPool(config.Config{}, proxylog)
 	s := &Server{
 		cfg:         config.Config{},
 		muxlog:      logmon.NewWriter(io.Discard),
@@ -68,6 +71,8 @@ func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 		metrics:     newMetricsMonitor(proxylog, 0, 0),
 		local:       local,
 		peer:        peer,
+		pool:        pool,
+		auth:        authMgr,
 		shutdownCtx: ctx,
 		shutdownFn:  cancel,
 	}

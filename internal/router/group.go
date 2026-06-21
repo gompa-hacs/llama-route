@@ -41,6 +41,9 @@ func NewGroup(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Group
 			base.procCancel()
 			return nil, fmt.Errorf("no model config for %q", mid)
 		}
+		if modelCfg.UsesPool() {
+			continue
+		}
 		procLog := logmon.NewWriter(upstreamlog)
 		p, err := process.New(base.procCtx, mid, modelCfg, procLog, proxylog)
 		if err != nil {

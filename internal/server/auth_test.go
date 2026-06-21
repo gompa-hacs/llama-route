@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
 )
 
@@ -80,7 +81,11 @@ func TestServer_AuthMiddleware(t *testing.T) {
 	})
 
 	t.Run("no keys configured passes through", func(t *testing.T) {
-		mw := CreateAuthMiddleware(config.Config{})
+		mgr, err := auth.NewManager(config.Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mw := CreateAuthMiddleware(mgr)
 		w := httptest.NewRecorder()
 		mw(final).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
 		if w.Code != http.StatusOK {
@@ -89,9 +94,13 @@ func TestServer_AuthMiddleware(t *testing.T) {
 	})
 
 	cfg := config.Config{RequiredAPIKeys: []string{"secret"}}
+	mgr, err := auth.NewManager(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	t.Run("valid key", func(t *testing.T) {
-		mw := CreateAuthMiddleware(cfg)
+		mw := CreateAuthMiddleware(mgr)
 		r := httptest.NewRequest(http.MethodGet, "/", nil)
 		r.Header.Set("Authorization", "Bearer secret")
 		w := httptest.NewRecorder()
@@ -102,7 +111,7 @@ func TestServer_AuthMiddleware(t *testing.T) {
 	})
 
 	t.Run("invalid key", func(t *testing.T) {
-		mw := CreateAuthMiddleware(cfg)
+		mw := CreateAuthMiddleware(mgr)
 		r := httptest.NewRequest(http.MethodGet, "/", nil)
 		r.Header.Set("Authorization", "Bearer wrong")
 		w := httptest.NewRecorder()

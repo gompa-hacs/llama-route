@@ -8,9 +8,12 @@
   import Performance from "./routes/Performance.svelte";
   import Playground from "./routes/Playground.svelte";
   import PlaygroundStub from "./routes/PlaygroundStub.svelte";
+  import Login from "./routes/Login.svelte";
+  import ApiKeys from "./routes/ApiKeys.svelte";
   import { enableAPIEvents } from "./stores/api";
   import { initScreenWidth, initSystemThemeListener, isDarkMode, appTitle, connectionState } from "./stores/theme";
   import { currentRoute } from "./stores/route";
+  import { adminRequired, authenticated, authChecked, refreshAuthSession } from "./stores/auth";
 
   const routes = {
     "/": PlaygroundStub,
@@ -18,6 +21,7 @@
     "/logs": LogViewer,
     "/activity": Activity,
     "/performance": Performance,
+    "/keys": ApiKeys,
     "*": PlaygroundStub,
   };
 
@@ -36,9 +40,9 @@
   });
 
   onMount(() => {
+    void refreshAuthSession();
     const cleanupScreenWidth = initScreenWidth();
     const cleanupSystemTheme = initSystemThemeListener();
-    enableAPIEvents(true);
 
     return () => {
       cleanupScreenWidth();
@@ -46,8 +50,19 @@
       enableAPIEvents(false);
     };
   });
+
+  $effect(() => {
+    if ($authChecked && (!$adminRequired || $authenticated)) {
+      enableAPIEvents(true);
+    } else {
+      enableAPIEvents(false);
+    }
+  });
 </script>
 
+{#if $authChecked && $adminRequired && !$authenticated}
+  <Login />
+{:else}
 <div class="flex flex-col h-screen">
   <Header />
 
@@ -60,3 +75,4 @@
     </div>
   </main>
 </div>
+{/if}

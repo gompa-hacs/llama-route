@@ -163,6 +163,9 @@ type Config struct {
 
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
+
+	// admin configures dashboard login and UI-managed API keys.
+	Admin AdminConfig `yaml:"admin"`
 }
 
 // RoutingConfig is the canonical, normalized routing/scheduling configuration.
@@ -386,12 +389,18 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 				}
 				modelConfig.Metadata = result.(map[string]any)
 			}
+
+			if modelConfig.Pool != nil {
+				for i := range modelConfig.Pool.Backends {
+					modelConfig.Pool.Backends[i].Proxy = strings.ReplaceAll(modelConfig.Pool.Backends[i].Proxy, macroSlug, macroStr)
+				}
+			}
 		}
 
-		// Handle PORT macro - only allocate if cmd uses it
+		// Handle PORT macro - only allocate if cmd uses it (pool-only models skip this)
 		cmdHasPort := strings.Contains(modelConfig.Cmd, "${PORT}")
 		proxyHasPort := strings.Contains(modelConfig.Proxy, "${PORT}")
-		if cmdHasPort || proxyHasPort {
+		if !modelConfig.UsesPool() && (cmdHasPort || proxyHasPort) {
 			if !cmdHasPort && proxyHasPort {
 				return Config{}, fmt.Errorf("model %s: proxy uses ${PORT} but cmd does not - ${PORT} is only available when used in cmd", modelId)
 			}
@@ -451,6 +460,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
 		}
 
+		if err := validatePoolConfig(modelId, modelConfig.Pool); err != nil {
+			return Config{}, err
+		}
+
 		// Validate SetParamsByID keys and values
 		for key, paramMap := range modelConfig.Filters.SetParamsByID {
 			if matches := macroPatternRegex.FindAllStringSubmatch(key, -1); len(matches) > 0 {
@@ -479,8 +492,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			modelConfig.Aliases = append(modelConfig.Aliases, key)
 		}
 
-		if _, err := url.Parse(modelConfig.Proxy); err != nil {
-			return Config{}, fmt.Errorf("model %s: invalid proxy URL: %w", modelId, err)
+		if !modelConfig.UsesPool() {
+			if _, err := url.Parse(modelConfig.Proxy); err != nil {
+				return Config{}, fmt.Errorf("model %s: invalid proxy URL: %w", modelId, err)
+			}
 		}
 
 		if modelConfig.SendLoadingState == nil {
@@ -634,6 +649,11 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			}
 		}
 		config.Peers[peerName] = peerConfig
+	}
+
+	config.Admin.Password = strings.TrimSpace(config.Admin.Password)
+	if err := validateAdminConfig(config.Admin); err != nil {
+		return Config{}, err
 	}
 
 	return config, nil

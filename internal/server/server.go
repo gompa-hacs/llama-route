@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
@@ -35,6 +36,8 @@ type Server struct {
 
 	local router.LocalRouter
 	peer  router.Router
+	pool  router.Router
+	auth  *auth.Manager
 
 	mux     *http.ServeMux
 	handler http.Handler
@@ -118,8 +121,12 @@ type BuildInfo struct {
 }
 
 func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, build BuildInfo) (*Server, error) {
+	authMgr, err := auth.NewManager(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("creating auth manager: %w", err)
+	}
+
 	var local router.LocalRouter
-	var err error
 
 	switch cfg.Routing.Router.Use {
 	case "matrix":
@@ -139,6 +146,11 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		return nil, fmt.Errorf("creating peer router: %w", err)
 	}
 
+	pool, err := router.NewPool(cfg, proxylog)
+	if err != nil {
+		return nil, fmt.Errorf("creating pool router: %w", err)
+	}
+
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	s := &Server{
 		cfg:         cfg,
@@ -151,6 +163,8 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		build:       build,
 		local:       local,
 		peer:        peer,
+		pool:        pool,
+		auth:        authMgr,
 		shutdownCtx: shutdownCtx,
 		shutdownFn:  shutdownFn,
 	}
@@ -171,6 +185,9 @@ func (s *Server) localPeerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case s.pool != nil && s.pool.Handles(data.ModelID):
+		s.proxylog.Debugf("dispatch: using pool for model: %s", data.ModelID)
+		s.pool.ServeHTTP(w, r)
 	case s.local.Handles(data.ModelID):
 		s.proxylog.Debugf("dispatch: using local process for model: %s", data.ModelID)
 		s.local.ServeHTTP(w, r)
@@ -194,17 +211,18 @@ func stripVersionPrefix(r *http.Request) {
 // global CORS middleware.
 func (s *Server) routes() {
 
-	authMW := CreateAuthMiddleware(s.cfg)
+	inferenceAuth := CreateInferenceAuthMiddleware(s.auth)
+	dashboardAuth := CreateAdminAuthMiddleware(s.auth)
+
 	modelChain := chain.New(
-		authMW,
+		inferenceAuth,
 		CreateRequestContextMiddleware(s.cfg),
 		CreateFilterMiddleware(s.cfg),
 		CreateFormFilterMiddleware(s.cfg),
 		CreateInflightMiddleware(s.inflight),
 		CreateMetricsMiddleware(s.metrics, s.cfg),
 	)
-	// Custom endpoints only need auth.
-	apiChain := chain.New(authMW)
+	dashboardChain := chain.New(dashboardAuth)
 
 	mux := http.NewServeMux()
 	dispatch := http.HandlerFunc(s.localPeerHandler)
@@ -219,41 +237,44 @@ func (s *Server) routes() {
 		mux.Handle("GET "+path, modelChain.Then(dispatch))
 	}
 
-	// llama-swap API + custom endpoints.
-	mux.Handle("GET /v1/models", apiChain.ThenFunc(s.handleListModels))
-	mux.Handle("GET /logs", apiChain.ThenFunc(s.handleLogs))
-	mux.Handle("GET /logs/stream", apiChain.ThenFunc(s.handleLogStream))
-	mux.Handle("GET /logs/stream/{logMonitorID...}", apiChain.ThenFunc(s.handleLogStream))
+	// OpenAI model listing uses inference keys.
+	mux.Handle("GET /v1/models", chain.New(inferenceAuth).ThenFunc(s.handleListModels))
+
+	// Public auth endpoints for the dashboard login flow.
+	mux.HandleFunc("GET /api/auth/session", s.handleAuthSession)
+	mux.HandleFunc("POST /api/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
+
+	mux.Handle("GET /logs", dashboardChain.ThenFunc(s.handleLogs))
+	mux.Handle("GET /logs/stream", dashboardChain.ThenFunc(s.handleLogStream))
+	mux.Handle("GET /logs/stream/{logMonitorID...}", dashboardChain.ThenFunc(s.handleLogStream))
 
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /wol-health", handleHealth)
 	mux.HandleFunc("GET /{$}", handleRootRedirect)
 
-	// Embedded UI.
-	mux.Handle("GET /ui/", chain.New(authMW).ThenFunc(s.handleUI))
-	mux.HandleFunc("GET /favicon.ico", s.handleFavicon)
+	mux.Handle("GET /ui/", dashboardChain.ThenFunc(s.handleUI))
+	mux.Handle("GET /favicon.ico", dashboardChain.ThenFunc(s.handleFavicon))
 
-	// Prometheus metrics (wrapped by apiChain, matches the legacy endpoint).
-	mux.Handle("GET /metrics", apiChain.ThenFunc(s.handleMetrics))
+	mux.Handle("GET /metrics", dashboardChain.ThenFunc(s.handleMetrics))
 
-	// Operations endpoints.
-	mux.Handle("GET /unload", apiChain.ThenFunc(s.handleUnload))
-	mux.Handle("GET /running", apiChain.ThenFunc(s.handleRunning))
+	mux.Handle("GET /unload", dashboardChain.ThenFunc(s.handleUnload))
+	mux.Handle("GET /running", dashboardChain.ThenFunc(s.handleRunning))
 
-	// Upstream passthrough. Meter only the model-dispatched endpoints that can
-	// produce token usage/timings.
-	upstreamChain := apiChain.Append(CreateMetricsMiddleware(s.metrics, s.cfg))
+	upstreamChain := dashboardChain.Append(CreateMetricsMiddleware(s.metrics, s.cfg))
 	mux.HandleFunc("GET /upstream", handleUpstreamRedirect)
 	mux.Handle("/upstream/{upstreamPath...}", upstreamChain.ThenFunc(s.handleUpstream))
 
-	// API group (API-key protected) consumed by the UI.
-	mux.Handle("POST /api/models/unload", apiChain.ThenFunc(s.handleAPIUnloadAll))
-	mux.Handle("POST /api/models/unload/{model...}", apiChain.ThenFunc(s.handleAPIUnloadModel))
-	mux.Handle("GET /api/events", apiChain.ThenFunc(s.handleAPIEvents))
-	mux.Handle("GET /api/metrics", apiChain.ThenFunc(s.handleAPIMetrics))
-	mux.Handle("GET /api/performance", apiChain.ThenFunc(s.handleAPIPerformance))
-	mux.Handle("GET /api/version", apiChain.ThenFunc(s.handleAPIVersion))
-	mux.Handle("GET /api/captures/{id}", apiChain.ThenFunc(s.handleAPICapture))
+	mux.Handle("POST /api/models/unload", dashboardChain.ThenFunc(s.handleAPIUnloadAll))
+	mux.Handle("POST /api/models/unload/{model...}", dashboardChain.ThenFunc(s.handleAPIUnloadModel))
+	mux.Handle("GET /api/events", dashboardChain.ThenFunc(s.handleAPIEvents))
+	mux.Handle("GET /api/metrics", dashboardChain.ThenFunc(s.handleAPIMetrics))
+	mux.Handle("GET /api/performance", dashboardChain.ThenFunc(s.handleAPIPerformance))
+	mux.Handle("GET /api/version", dashboardChain.ThenFunc(s.handleAPIVersion))
+	mux.Handle("GET /api/captures/{id}", dashboardChain.ThenFunc(s.handleAPICapture))
+	mux.Handle("GET /api/admin/keys", dashboardChain.ThenFunc(s.handleAdminListKeys))
+	mux.Handle("POST /api/admin/keys", dashboardChain.ThenFunc(s.handleAdminCreateKey))
+	mux.Handle("DELETE /api/admin/keys/{id}", dashboardChain.ThenFunc(s.handleAdminRevokeKey))
 
 	s.mux = mux
 	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware()).Then(mux)
@@ -287,7 +308,7 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 	var mu sync.Mutex
 	var errs []error
 
-	for _, rt := range []router.Router{s.local, s.peer} {
+	for _, rt := range []router.Router{s.local, s.pool, s.peer} {
 		if rt == nil {
 			continue
 		}

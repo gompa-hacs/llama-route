@@ -10,6 +10,7 @@ import type {
   PerformanceResponse,
 } from "../lib/types";
 import { connectionState } from "./theme";
+import { authFetch } from "./auth";
 
 const LOG_LENGTH_LIMIT = 1024 * 100; /* 100KB of log data */
 
@@ -122,7 +123,7 @@ export function enableAPIEvents(enabled: boolean): void {
 connectionState.subscribe(async (status) => {
   if (status === "connected") {
     try {
-      const response = await fetch("/api/version");
+      const response = await authFetch("/api/version");
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
@@ -136,7 +137,7 @@ connectionState.subscribe(async (status) => {
 
 export async function listModels(): Promise<Model[]> {
   try {
-    const response = await fetch("/api/models/");
+    const response = await authFetch("/api/models/");
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
@@ -150,7 +151,7 @@ export async function listModels(): Promise<Model[]> {
 
 export async function unloadAllModels(): Promise<void> {
   try {
-    const response = await fetch(`/api/models/unload`, {
+    const response = await authFetch(`/api/models/unload`, {
       method: "POST",
     });
     if (!response.ok) {
@@ -164,7 +165,7 @@ export async function unloadAllModels(): Promise<void> {
 
 export async function unloadSingleModel(model: string): Promise<void> {
   try {
-    const response = await fetch(`/api/models/unload/${model}`, {
+    const response = await authFetch(`/api/models/unload/${model}`, {
       method: "POST",
     });
     if (!response.ok) {
@@ -178,7 +179,7 @@ export async function unloadSingleModel(model: string): Promise<void> {
 
 export async function loadModel(model: string, signal?: AbortSignal): Promise<void> {
   try {
-    const response = await fetch(`/upstream/${model}/?_=${Date.now()}`, {
+    const response = await authFetch(`/upstream/${model}/?_=${Date.now()}`, {
       method: "GET",
       signal,
     });
@@ -196,7 +197,7 @@ export async function loadModel(model: string, signal?: AbortSignal): Promise<vo
 
 export async function getCapture(id: number): Promise<ReqRespCapture | null> {
   try {
-    const response = await fetch(`/api/captures/${id}`);
+    const response = await authFetch(`/api/captures/${id}`);
     if (response.status === 404) {
       return null;
     }
@@ -213,7 +214,7 @@ export async function getCapture(id: number): Promise<ReqRespCapture | null> {
 export async function fetchPerformance(after?: string): Promise<PerformanceResponse | null> {
   try {
     const url = after ? `/api/performance?after=${encodeURIComponent(after)}` : "/api/performance";
-    const response = await fetch(url);
+    const response = await authFetch(url);
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
