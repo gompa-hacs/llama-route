@@ -256,9 +256,6 @@
             "description": "A dictionary of model configurations. Each key is a model's ID. Model settings have defaults if not defined. The model's ID is available as ${MODEL_ID}.",
             "additionalProperties": {
                 "type": "object",
-                "required": [
-                    "cmd"
-                ],
                 "properties": {
                     "macros": {
                         "$ref": "#/definitions/macros"
