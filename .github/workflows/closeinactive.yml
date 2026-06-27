@@ -1,8 +1,8 @@
 # https://docs.github.com/en/actions/use-cases-and-examples/project-management/closing-inactive-issues
 name: Close inactive issues
 on:
-  schedule:
-    - cron: "32 1 * * *"
+  # schedule:
+  #   - cron: "32 1 * * *"
 
 jobs:
   close-issues:
