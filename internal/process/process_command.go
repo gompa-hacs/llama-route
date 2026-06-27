@@ -2,7 +2,9 @@ package process
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -78,6 +80,15 @@ type ProcessCommand struct {
 
 	// current ProcessState. Written only by run(); read by State() via atomic load.
 	state atomic.Value
+
+	// upstreamCtxLen holds the context length auto-detected from the upstream
+	// server's /props endpoint after the health check passes.
+	upstreamCtxLen atomic.Int64
+
+	// onContextDetected is an optional callback fired when a context length is
+	// successfully auto-detected from the upstream server. The router sets
+	// this to persist the value in a cache that survives process restarts.
+	onContextDetected func(modelID string, ctxLen int)
 
 	// stores the active reverse-proxy handler when the process is running.
 	// Written only by run(); read by ServeHTTP via atomic load.
@@ -465,6 +476,8 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 
 	checkEndpoint := strings.TrimSpace(p.config.CheckEndpoint)
 	if checkEndpoint == "none" {
+		// Best-effort: detect context length from upstream /props even without health check.
+		p.detectUpstreamContextLength(startCtx, reverseProxy)
 		return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cmdCancel, handlerFn: handlerFn}
 	}
 
@@ -496,6 +509,9 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
 			p.proxyLogger.Infof("<%s> Health check passed on %s%s", p.id, p.config.Proxy, p.config.CheckEndpoint)
+
+			// Best-effort: detect context length from upstream /props.
+			p.detectUpstreamContextLength(startCtx, reverseProxy)
 			break
 		} else if startCtx.Err() != nil {
 			return abort(ErrStartAborted)
@@ -660,6 +676,82 @@ func (p *ProcessCommand) Stop(timeout time.Duration) error {
 		return fmt.Errorf("[%s] shutdown", p.id)
 	}
 	return <-req.respond
+}
+
+// UpstreamContextLength returns the context length auto-detected from the
+// upstream server's /props endpoint. Returns 0 when detection failed or the
+// process is not running.
+func (p *ProcessCommand) UpstreamContextLength() int {
+	return int(p.upstreamCtxLen.Load())
+}
+
+// SetOnContextDetected sets a callback invoked when a context length is
+// successfully auto-detected from the upstream server. The router uses this
+// to persist the value across process restarts.
+func (p *ProcessCommand) SetOnContextDetected(fn func(modelID string, ctxLen int)) {
+	p.onContextDetected = fn
+}
+
+// upstreamProps is a minimal struct for extracting n_ctx from the llama.cpp
+// /props endpoint response. Different versions of llama.cpp return n_ctx at
+// different paths, so we try all known locations.
+type upstreamProps struct {
+	// Standard path (llama.cpp >= b3091)
+	DefaultGenerationSettings struct {
+		NCtx int `json:"n_ctx"`
+	} `json:"default_generation_settings"`
+	// Top-level fallback (some builds)
+	NCtx int `json:"n_ctx"`
+}
+
+// extractAndStoreContextLength parses a /props JSON body and stores the
+// detected context length into the process. Silently ignores parse errors.
+func extractAndStoreContextLength(body []byte, p *ProcessCommand) {
+	var props upstreamProps
+	if err := json.Unmarshal(body, &props); err != nil {
+		p.proxyLogger.Debugf("<%s> /props parse error: %v", p.id, err)
+		return
+	}
+	ctxLen := props.DefaultGenerationSettings.NCtx
+	if ctxLen == 0 {
+		ctxLen = props.NCtx
+	}
+	if ctxLen > 0 {
+		p.upstreamCtxLen.Store(int64(ctxLen))
+		p.proxyLogger.Infof("<%s> auto-detected context length: %d", p.id, ctxLen)
+		if p.onContextDetected != nil {
+			p.onContextDetected(p.id, ctxLen)
+		}
+	} else {
+		p.proxyLogger.Infof("<%s> /props OK but no n_ctx found (body: %s)", p.id, string(body))
+	}
+}
+
+// detectUpstreamContextLength queries the upstream's /props endpoint to extract
+// the context length (default_generation_settings.n_ctx). Best-effort: failures
+// are silent and leave the stored value at 0.
+func (p *ProcessCommand) detectUpstreamContextLength(startCtx context.Context, reverseProxy *httputil.ReverseProxy) {
+	req, err := http.NewRequestWithContext(startCtx, http.MethodGet, "/props", nil)
+	if err != nil {
+		return
+	}
+	rr := httptest.NewRecorder()
+	reverseProxy.ServeHTTP(rr, req)
+	resp := rr.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		p.proxyLogger.Infof("<%s> /props returned %d, skipping context detection", p.id, resp.StatusCode)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		p.proxyLogger.Infof("<%s> /props read error: %v", p.id, err)
+		return
+	}
+
+	// Parse only the field we need to keep the dependency footprint small.
+	extractAndStoreContextLength(body, p)
 }
 
 func (p *ProcessCommand) State() ProcessState {

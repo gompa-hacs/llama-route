@@ -46,4 +46,10 @@ type Process interface {
 
 	// Logger returns the monitor that captures this process's stdout/stderr.
 	Logger() *logmon.Monitor
+
+	// UpstreamContextLength returns the context length auto-detected from the
+	// upstream server's /props endpoint. Returns 0 when the upstream has not
+	// been queried yet, the detection failed, or the value is not available
+	// (e.g. the process is not running).
+	UpstreamContextLength() int
 }

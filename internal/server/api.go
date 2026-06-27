@@ -1,8 +1,11 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -131,13 +134,59 @@ func filterCappedMetadata(md map[string]any) map[string]any {
 	return filtered
 }
 
+// queryUpstreamContextLength makes a best-effort request to proxyURL+"/props"
+// to extract n_ctx from a running upstream. Fails silently when the upstream
+// is unreachable.
+func queryUpstreamContextLength(proxyURL string) int {
+	u, err := url.Parse(proxyURL)
+	if err != nil || u.Host == "" {
+		return 0
+	}
+	u = u.JoinPath("/props")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return 0
+	}
+
+	var props struct {
+		DefaultGenerationSettings struct {
+			NCtx int `json:"n_ctx"`
+		} `json:"default_generation_settings"`
+		NCtx int `json:"n_ctx"`
+	}
+	if err := json.Unmarshal(body, &props); err != nil {
+		return 0
+	}
+	if ctxLen := props.DefaultGenerationSettings.NCtx; ctxLen > 0 {
+		return ctxLen
+	}
+	return props.NCtx
+}
+
 // handleListModels serves the OpenAI-compatible model listing: local models
 // (with optional aliases) plus peer models.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 	data := make([]modelRecord, 0, len(s.cfg.Models))
 
-	newRecord := func(id, name, description string, metadata map[string]any, caps config.ModelCapConfig) modelRecord {
+	newRecord := func(id, name, description string, metadata map[string]any, caps config.ModelCapConfig, mc *config.ModelConfig) modelRecord {
 		rec := modelRecord{
 			ID:          id,
 			Object:      "model",
@@ -147,6 +196,20 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 			Description: strings.TrimSpace(description),
 		}
 		rec.Architecture, rec.Capabilities, rec.SupportedParameters, rec.ContextLength = renderCapabilities(caps)
+		// Fall back to auto-detected context length from the upstream when
+		// capabilities.context is not set in the config.
+		if rec.ContextLength == 0 {
+			rec.ContextLength = s.local.UpstreamContextLength(id)
+		}
+		// Static fallback: parse -c/--ctx-size flags from the command string.
+		if rec.ContextLength == 0 && mc != nil {
+			rec.ContextLength = mc.ExtractContextSizeFromCmd()
+		}
+		// Live fallback: query upstream /props when the upstream is already running
+		// (proxy-only models or models that were started externally).
+		if rec.ContextLength == 0 && mc != nil && mc.Proxy != "" {
+			rec.ContextLength = queryUpstreamContextLength(mc.Proxy)
+		}
 		if !caps.Empty() {
 			metadata = filterCappedMetadata(metadata)
 		}
@@ -160,12 +223,12 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		if mc.Unlisted {
 			continue
 		}
-		data = append(data, newRecord(id, mc.Name, mc.Description, mc.Metadata, mc.Capabilities))
+		data = append(data, newRecord(id, mc.Name, mc.Description, mc.Metadata, mc.Capabilities, &mc))
 
 		if s.cfg.IncludeAliasesInList {
 			for _, alias := range mc.Aliases {
 				if alias := strings.TrimSpace(alias); alias != "" {
-					data = append(data, newRecord(alias, mc.Name, mc.Description, mc.Metadata, mc.Capabilities))
+					data = append(data, newRecord(alias, mc.Name, mc.Description, mc.Metadata, mc.Capabilities, &mc))
 				}
 			}
 		}
@@ -173,7 +236,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 	for peerID, peer := range s.cfg.Peers {
 		for _, modelID := range peer.Models {
-			data = append(data, newRecord(modelID, peerID+": "+modelID, "", map[string]any{"peerID": peerID}, config.ModelCapConfig{}))
+			data = append(data, newRecord(modelID, peerID+": "+modelID, "", map[string]any{"peerID": peerID}, config.ModelCapConfig{}, nil))
 		}
 	}
 

@@ -43,6 +43,8 @@ func NewMatrix(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Matr
 			return nil, fmt.Errorf("creating process for %q: %w", mid, err)
 		}
 		processes[mid] = p
+		// Wire auto-detected context lengths back into the persistent router cache.
+		p.SetOnContextDetected(base.cacheDetectedContext)
 	}
 
 	r := &Matrix{baseRouter: base}

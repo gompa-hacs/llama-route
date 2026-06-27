@@ -334,3 +334,31 @@ models:
 		assert.Contains(t, err.Error(), "video")
 	})
 }
+
+func TestExtractContextSizeFromCmd(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		want int
+	}{
+		{"empty", "", 0},
+		{"no_flags", "llama-server -m model.gguf", 0},
+		{"ctx_size_double_dash", "llama-server --ctx-size 32768 -m model.gguf", 32768},
+		{"ctx_size_short_c", "llama-server -c 16384 -m model.gguf", 16384},
+		{"ctx_size_flag", "llama-server -ctx 8192 -m model.gguf", 8192},
+		{"context_flag", "llama-server --context 4096 -m model.gguf", 4096},
+		{"equals_form", "llama-server --ctx-size=65536 -m model.gguf", 65536},
+		{"short_c_equals", "llama-server -c=8192 -m model.gguf", 8192},
+		{"multiline", "llama-server \\\n  --ctx-size 2048 \\\n  -m model.gguf", 2048},
+		{"first_wins", "llama-server --ctx-size 1000 -c 2000", 1000},
+		{"invalid_value", "llama-server --ctx-size abc -m model.gguf", 0},
+		{"missing_value", "llama-server --ctx-size -m model.gguf", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := &ModelConfig{Cmd: tt.cmd}
+			got := mc.ExtractContextSizeFromCmd()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

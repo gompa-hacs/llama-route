@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strconv"
+	"strings"
 )
 
 const (
@@ -155,6 +157,37 @@ func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 func (m *ModelConfig) SanitizedCommand() ([]string, error) {
 	return SanitizeCommand(m.Cmd)
+}
+
+// ExtractContextSizeFromCmd parses the model's command for llama.cpp context
+// size flags. Recognizes --ctx-size, -c, -ctx, and --context. Returns 0 if
+// no recognized flag is found or the command is empty.
+func (m *ModelConfig) ExtractContextSizeFromCmd() int {
+	args, err := m.SanitizedCommand()
+	if err != nil || len(args) < 2 {
+		return 0
+	}
+	// Skip argv[0]; scan remaining args for known context-size flags.
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "--ctx-size", "--context", "-c", "-ctx":
+			if i+1 < len(args) {
+				if n, parseErr := strconv.Atoi(args[i+1]); parseErr == nil && n > 0 {
+					return n
+				}
+			}
+		}
+		// Also handle --ctx-size=32768 form
+		for _, prefix := range []string{"--ctx-size=", "--context=", "-c=", "-ctx="} {
+			if strings.HasPrefix(arg, prefix) {
+				if n, parseErr := strconv.Atoi(strings.TrimPrefix(arg, prefix)); parseErr == nil && n > 0 {
+					return n
+				}
+			}
+		}
+	}
+	return 0
 }
 
 // ModelFilters embeds Filters and adds legacy support for strip_params field

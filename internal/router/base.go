@@ -67,6 +67,12 @@ type baseRouter struct {
 	// events are intentionally NOT signalled here so test event counts
 	// remain stable.
 	testProcessed chan struct{}
+
+	// detectedCtxCache persists auto-detected context lengths across process
+	// stop/start cycles so models that are currently stopped still report
+	// their context size in /v1/models.
+	detectedCtxCache map[string]int
+	detectedCtxMu    sync.RWMutex
 }
 
 func newBaseRouter(
@@ -343,6 +349,35 @@ func (b *baseRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 		return p.Logger(), true
 	}
 	return nil, false
+}
+
+// UpstreamContextLength returns the context length auto-detected from the
+// upstream server's /props endpoint. Returns 0 when no context length has been
+// detected or the model is not found.
+func (b *baseRouter) UpstreamContextLength(modelID string) int {
+	// Check the persistent cache first (survives process stop/start cycles).
+	b.detectedCtxMu.RLock()
+	if ctxLen, ok := b.detectedCtxCache[modelID]; ok && ctxLen > 0 {
+		b.detectedCtxMu.RUnlock()
+		return ctxLen
+	}
+	b.detectedCtxMu.RUnlock()
+
+	if p, ok := b.processes[modelID]; ok {
+		return p.UpstreamContextLength()
+	}
+	return 0
+}
+
+// cacheDetectedContext stores a detected context length in the persistent
+// cache. Called by process detection callbacks.
+func (b *baseRouter) cacheDetectedContext(modelID string, ctxLen int) {
+	b.detectedCtxMu.Lock()
+	if b.detectedCtxCache == nil {
+		b.detectedCtxCache = make(map[string]int)
+	}
+	b.detectedCtxCache[modelID] = ctxLen
+	b.detectedCtxMu.Unlock()
 }
 
 // RunningModels returns the current state of every process that is not stopped

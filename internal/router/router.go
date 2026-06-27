@@ -49,4 +49,9 @@ type LocalRouter interface {
 	// modelID must be a real (non-alias) config key. Returns false when the
 	// model is not known to this router.
 	ProcessLogger(modelID string) (*logmon.Monitor, bool)
+
+	// UpstreamContextLength returns the context length auto-detected from the
+	// upstream server's /props endpoint for the given model. Returns 0 when
+	// no context length has been detected or the model is not found.
+	UpstreamContextLength(modelID string) int
 }
