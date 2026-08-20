@@ -38,6 +38,39 @@ Each `proxy` value is the **base URL** of an always-on server (typically
 `llama-server`). Request paths such as `/v1/chat/completions` are forwarded
 unchanged.
 
+### Spawnable backends (cmd per GPU)
+
+Backends may also declare a `cmd` so llama-swap starts the process itself
+(one name, N GPUs, load-balanced):
+
+```yaml
+startPort: 10000
+
+models:
+  whisper:
+    capabilities:
+      in: [audio]
+      out: [text]
+    pool:
+      start: preload          # or on_demand (default)
+      restartOnCrash: true    # default true
+      backends:
+        - cmd: >
+            whisper-server --port ${PORT} -m /models/whisper.bin …
+          env: ["CUDA_VISIBLE_DEVICES=0"]
+        - cmd: >
+            whisper-server --port ${PORT} -m /models/whisper.bin …
+          env: ["CUDA_VISIBLE_DEVICES=1"]
+        - cmd: >
+            whisper-server --port ${PORT} -m /models/whisper.bin …
+          env: ["CUDA_VISIBLE_DEVICES=2"]
+```
+
+- `${PORT}` is allocated per spawn backend from `startPort`
+- `proxy` defaults to `http://127.0.0.1:${PORT}` when omitted
+- Do **not** set model-level `cmd` together with `pool`
+- Mix static `proxy:` and spawn `cmd:` backends in the same pool if needed
+
 ### Full pool options
 
 ```yaml
@@ -69,8 +102,21 @@ models:
 | ----- | ------- | ----------- |
 | `strategy` | `sticky_least_inflight` | Assign new sessions to the least-busy backend; stick follow-ups to that backend. |
 | `affinityTTL` | `30m` | Idle time before an affinity mapping expires. |
-| `backends` | *(required)* | List of upstream base URLs. |
+| `start` | `on_demand` | When to launch spawn backends: `on_demand` or `preload`. |
+| `restartOnCrash` | `true` | Restart spawn backends that exit unexpectedly. |
+| `backends` | *(required)* | List of upstreams (`proxy` and/or `cmd`). |
 | `affinity` | See below | Ordered list of rules for sticky session keys. |
+
+Per-backend fields:
+
+| Field | Description |
+| ----- | ----------- |
+| `proxy` | Upstream base URL (required unless `cmd` is set). |
+| `cmd` | Start command for a spawnable sidecar (`${PORT}` supported). |
+| `cmdStop` | Optional stop command (same as model-level). |
+| `env` | Environment variables for the sidecar (e.g. `CUDA_VISIBLE_DEVICES`). |
+| `checkEndpoint` | Health path override (default: model `/health`). |
+| `contextSize` | Max `n_ctx` this backend supports (`0` = unknown/unlimited). |
 
 ### How routing works
 
@@ -146,9 +192,12 @@ llama-swap supports **two layers** of authentication:
 | Layer | Protects | Mechanism |
 | ----- | -------- | --------- |
 | **Inference** | `/v1/*` and other model inference routes | API key (`Authorization: Bearer …`, `x-api-key`, or Basic password field) |
-| **Dashboard** | `/ui/*`, `/api/*`, `/logs*`, `/metrics`, `/running`, `/unload`, `/upstream/*` | Admin session cookie when `admin.password` is set |
+| **Dashboard** | `/ui/*`, `/api/*`, `/logs*`, `/metrics`, `/running`, `/unload`, `/upstream/*` | Admin session cookie when `admin.password` is set; otherwise inference API key if configured |
 
 `/health` and `/wol-health` remain public for probes.
+
+When running on the public internet, terminate TLS in **nginx** (or similar)
+and bind llama-swap to localhost. See [`docs/examples/nginx/`](examples/nginx/).
 
 ### Admin login (dashboard)
 
@@ -192,7 +241,7 @@ apiKeys:
 Create keys from the web UI: **API Keys** tab (`/ui/#/keys`), or via API:
 
 ```bash
-# After logging in (session cookie) or with a valid API key:
+# After logging in (session cookie):
 curl -X POST http://localhost:8080/api/admin/keys \
   -H 'Content-Type: application/json' \
   -d '{"name":"my-client"}' \
@@ -216,8 +265,12 @@ UI-managed keys are prefixed with `sk-ls-`.
 | ------ | ---------------- | ------------------------------ |
 | Nothing set | Open (default-allow) | Open |
 | `apiKeys` only | Requires API key | Requires API key |
-| `admin.password` only | Open | Requires login (or API key) |
-| Both | Requires API key | Requires login (or API key) |
+| `admin.password` only | Open | Requires login (session cookie) |
+| Both | Requires API key | Requires login (session cookie) |
+
+Inference API keys **do not** unlock the dashboard when `admin.password` is
+set. That split is intentional for reverse-proxy deployments: clients keep a
+chat key, while `/ui` and ops endpoints require the admin password.
 
 ### Playground and inference from the browser
 
@@ -287,5 +340,9 @@ manage keys, and use the playground.
 - Protect `admin.keysFile` (mode `0600`); it contains bcrypt hashes.
 - UI key secrets are shown **once** at creation; they cannot be retrieved later.
 - Rotate keys by revoking and creating new ones.
-- For production, terminate TLS in front of llama-swap (reverse proxy) so session
-  cookies and API keys are not sent in cleartext.
+- For production / internet exposure, terminate TLS in nginx (or similar), bind
+  llama-swap with `--listen localhost:8080`, and set both `apiKeys` and
+  `admin.password`. See [`docs/examples/nginx/`](examples/nginx/).
+- `http.trustedProxies` defaults to loopback so `X-Forwarded-Proto` /
+  `X-Forwarded-For` from same-host nginx are honored (Secure cookies, real
+  client IPs in logs).

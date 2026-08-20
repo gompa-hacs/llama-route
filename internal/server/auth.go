@@ -28,9 +28,12 @@ func CreateInferenceAuthMiddleware(m *auth.Manager) chain.Middleware {
 	}
 }
 
-// CreateAdminAuthMiddleware protects dashboard routes. When admin login is
-// configured, a valid session cookie is required (API keys also work). When
-// only inference keys are configured, those are required instead.
+// CreateAdminAuthMiddleware protects dashboard routes.
+//
+//   - When admin.password is set: require a valid session cookie (inference
+//     API keys do not unlock the dashboard).
+//   - When only inference keys are configured: require a valid API key.
+//   - When neither is configured: allow (default-allow).
 func CreateAdminAuthMiddleware(m *auth.Manager) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		if m == nil {
@@ -38,7 +41,7 @@ func CreateAdminAuthMiddleware(m *auth.Manager) chain.Middleware {
 		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if m.AdminRequired() {
-				if m.SessionValid(sessionToken(r)) || m.ValidateInferenceKey(shared.ExtractAPIKey(r)) {
+				if m.SessionValid(sessionToken(r)) {
 					next.ServeHTTP(w, r)
 					return
 				}
@@ -56,6 +59,25 @@ func CreateAdminAuthMiddleware(m *auth.Manager) chain.Middleware {
 				return
 			}
 			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// CreateStripClientAuthMiddleware removes gateway credentials from the request
+// before they are forwarded to upstream backends. Call this after inference
+// auth and request-context extraction so affinity can still use the API key
+// from ReqContextData.
+func CreateStripClientAuthMiddleware() chain.Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") == "" && r.Header.Get("X-Api-Key") == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			r2 := r.Clone(r.Context())
+			r2.Header.Del("Authorization")
+			r2.Header.Del("X-Api-Key")
+			next.ServeHTTP(w, r2)
 		})
 	}
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/perf"
+	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
@@ -42,7 +43,10 @@ func (s *Server) modelStatus() []apiModel {
 	for _, id := range ids {
 		mc := s.cfg.Models[id]
 		state := "stopped"
-		if st, ok := running[id]; ok {
+		if s.cfg.IsPoolModel(id) {
+			// Always-on upstream backends — treat as ready for the dashboard.
+			state = "ready"
+		} else if st, ok := running[id]; ok {
 			state = string(st)
 		}
 		_, capsMap, _, _ := renderCapabilities(mc.Capabilities)
@@ -151,6 +155,28 @@ func (s *Server) handleAPIVersion(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAPIPeerMetrics serves aggregated peer metrics as a JSON object.
+func (s *Server) handleAPIPeerMetrics(w http.ResponseWriter, r *http.Request) {
+	if s.peerMetrics == nil {
+		shared.SendResponse(w, r, http.StatusServiceUnavailable, "peer metrics not available")
+		return
+	}
+	latest := s.peerMetrics.GetLatest()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(latest)
+}
+
+// handleAPIPoolMetrics serves live pool backend load/affinity state.
+func (s *Server) handleAPIPoolMetrics(w http.ResponseWriter, r *http.Request) {
+	pool, ok := s.pool.(*router.Pool)
+	if !ok || pool == nil {
+		shared.SendResponse(w, r, http.StatusServiceUnavailable, "pool metrics not available")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(pool.Stats())
+}
+
 // handleAPICapture returns the stored request/response capture for a metric ID.
 func (s *Server) handleAPICapture(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.Atoi(r.PathValue("id"))
@@ -180,6 +206,8 @@ const (
 	msgTypeModelStatus messageType = "modelStatus"
 	msgTypeLogData     messageType = "logData"
 	msgTypeMetrics     messageType = "metrics"
+	msgTypePeerMetrics messageType = "peerMetrics"
+	msgTypePoolMetrics messageType = "poolMetrics"
 	msgTypeInFlight    messageType = "inflight"
 )
 
@@ -239,6 +267,16 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			send(messageEnvelope{Type: msgTypeInFlight, Data: string(j)})
 		}
 	}
+	sendPeerMetrics := func(peers []shared.PeerMetricEntry) {
+		if j, err := json.Marshal(peers); err == nil {
+			send(messageEnvelope{Type: msgTypePeerMetrics, Data: string(j)})
+		}
+	}
+	sendPoolMetrics := func(snapshot shared.PoolMetricsSnapshot) {
+		if j, err := json.Marshal(snapshot); err == nil {
+			send(messageEnvelope{Type: msgTypePoolMetrics, Data: string(j)})
+		}
+	}
 
 	defer event.On(func(e shared.ProcessStateChangeEvent) { sendModels() })()
 	defer event.On(func(e shared.ConfigFileChangedEvent) { sendModels() })()
@@ -246,6 +284,8 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	defer s.upstreamlog.OnLogData(func(data []byte) { sendLogData("upstream", data) })()
 	defer event.On(func(e ActivityLogEvent) { sendMetrics([]ActivityLogEntry{e.Metrics}) })()
 	defer event.On(func(e shared.InFlightRequestsEvent) { sendInFlight(e.Total) })()
+	defer event.On(func(e shared.PeerMetricsUpdateEvent) { sendPeerMetrics(e.Peers) })()
+	defer event.On(func(e shared.PoolMetricsUpdateEvent) { sendPoolMetrics(e.Snapshot) })()
 
 	// initial payload
 	sendLogData("proxy", s.proxylog.GetHistory())
@@ -253,6 +293,9 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	sendModels()
 	sendMetrics(s.metrics.getMetrics())
 	sendInFlight(int(s.inflight.Current()))
+	if pool, ok := s.pool.(*router.Pool); ok && pool != nil {
+		sendPoolMetrics(pool.Stats())
+	}
 
 	for {
 		select {

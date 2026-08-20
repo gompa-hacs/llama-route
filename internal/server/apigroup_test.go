@@ -62,6 +62,29 @@ func TestServer_APIMetrics_Empty(t *testing.T) {
 	}
 }
 
+func TestServer_APIPoolMetrics_Empty(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/pool-metrics", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var got struct {
+		Models []any `json:"models"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Models == nil {
+		t.Fatal("models should be a non-nil slice")
+	}
+	if len(got.Models) != 0 {
+		t.Errorf("models = %v, want empty", got.Models)
+	}
+}
+
 func TestServer_APIPerformance_Unavailable(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 
@@ -95,7 +118,7 @@ func TestServer_APIEvents_InitialPayload(t *testing.T) {
 	}
 
 	body := w.Body.String()
-	for _, want := range []string{`"type":"modelStatus"`, `"type":"inflight"`, `"type":"logData"`} {
+	for _, want := range []string{`"type":"modelStatus"`, `"type":"inflight"`, `"type":"logData"`, `"type":"poolMetrics"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("initial SSE payload missing %s; body=%q", want, body)
 		}

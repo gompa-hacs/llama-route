@@ -1,35 +1,55 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/tidwall/gjson"
 )
 
 type poolBackend struct {
 	id           int
 	proxy        string
 	reverseProxy *httputil.ReverseProxy
+	healthy      atomic.Bool
+
+	// Spawnable sidecar (optional).
+	proc           process.Process
+	procID         string
+	restartOnCrash bool
+	healthTimeout  time.Duration
+
+	supOnce sync.Once
+	model   *poolModel // owning model; set after backends are appended
 }
 
 type poolModel struct {
-	modelID string
-	cfg     config.ModelConfig
-	rules   []config.AffinityRule
-	ttl     time.Duration
+	modelID   string
+	cfg       config.ModelConfig
+	rules     []config.AffinityRule
+	ttl       time.Duration
+	startMode string
 
-	backends []poolBackend
+	backends     []poolBackend
+	contextSizes []atomic.Int64 // parallel to backends; 0 = unknown/unlimited
 
 	mu       sync.Mutex
 	inflight []int
@@ -41,105 +61,275 @@ type affinityEntry struct {
 	expires   time.Time
 }
 
-// Pool forwards pooled models to always-on upstream backends with sticky
-// least-inflight load balancing.
+// Pool forwards pooled models to upstream backends with sticky least-inflight
+// load balancing. Backends may be static URLs or spawnable processes.
 type Pool struct {
-	cfg    config.Config
-	logger *logmon.Monitor
-	models map[string]*poolModel
+	cfg         config.Config
+	logger      *logmon.Monitor
+	upstreamlog *logmon.Monitor
+	models      map[string]*poolModel
 
 	shutdownCtx  context.Context
 	shutdownFn   context.CancelFunc
+	procCtx      context.Context
+	procCancel   context.CancelFunc
 	shuttingDown atomic.Bool
 	inflight     sync.WaitGroup
 }
 
-func NewPool(cfg config.Config, logger *logmon.Monitor) (*Pool, error) {
-	models := make(map[string]*poolModel)
+func NewPool(cfg config.Config, proxylog, upstreamlog *logmon.Monitor) (*Pool, error) {
+	if upstreamlog == nil {
+		upstreamlog = proxylog
+	}
+	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
+	procCtx, procCancel := context.WithCancel(context.Background())
+	pool := &Pool{
+		cfg:         cfg,
+		logger:      proxylog,
+		upstreamlog: upstreamlog,
+		models:      make(map[string]*poolModel),
+		shutdownCtx: shutdownCtx,
+		shutdownFn:  shutdownFn,
+		procCtx:     procCtx,
+		procCancel:  procCancel,
+	}
+
 	for id, mc := range cfg.Models {
 		if !mc.UsesPool() {
 			continue
 		}
-		pm, err := newPoolModel(id, mc)
+		pm, err := pool.newPoolModel(id, mc)
+		if err != nil {
+			shutdownFn()
+			procCancel()
+			return nil, err
+		}
+		pool.models[id] = pm
+		for _, alias := range mc.Aliases {
+			if _, dup := pool.models[alias]; dup {
+				shutdownFn()
+				procCancel()
+				return nil, fmt.Errorf("pool alias %q already mapped", alias)
+			}
+			pool.models[alias] = pm
+		}
+	}
+
+	pool.startProber()
+	pool.startMetricsEmitter()
+
+	// Preload spawn backends marked pool.start: preload.
+	for _, pm := range pool.uniqueModels() {
+		if pm.startMode == "preload" {
+			for i := range pm.backends {
+				if pm.backends[i].proc != nil {
+					pm.backends[i].kickSupervise(pool)
+				}
+			}
+		}
+	}
+
+	return pool, nil
+}
+
+func (p *Pool) uniqueModels() []*poolModel {
+	seen := make(map[*poolModel]struct{}, len(p.models))
+	out := make([]*poolModel, 0, len(p.models))
+	for _, pm := range p.models {
+		if _, ok := seen[pm]; ok {
+			continue
+		}
+		seen[pm] = struct{}{}
+		out = append(out, pm)
+	}
+	return out
+}
+
+func (p *Pool) newPoolModel(modelID string, mc config.ModelConfig) (*poolModel, error) {
+	poolCfg := mc.Pool
+	if poolCfg.StrategyName() != "sticky_least_inflight" {
+		return nil, fmt.Errorf("model %s: unsupported pool strategy %q", modelID, poolCfg.Strategy)
+	}
+
+	n := len(poolCfg.Backends)
+	pm := &poolModel{
+		modelID:      modelID,
+		cfg:          mc,
+		rules:        poolCfg.EffectiveAffinityRules(),
+		ttl:          poolCfg.AffinityDuration(),
+		startMode:    poolCfg.StartMode(),
+		backends:     make([]poolBackend, 0, n),
+		contextSizes: make([]atomic.Int64, n),
+		inflight:     make([]int, n),
+		affinity:     make(map[string]affinityEntry),
+	}
+
+	healthTimeout := time.Duration(mc.HealthCheckTimeout) * time.Second
+	if healthTimeout < 15*time.Second {
+		healthTimeout = 15 * time.Second
+	}
+
+	for i, b := range poolCfg.Backends {
+		backend, err := p.buildBackend(modelID, mc, i, b, healthTimeout)
 		if err != nil {
 			return nil, err
 		}
-		models[id] = pm
-		for _, alias := range mc.Aliases {
-			if _, dup := models[alias]; dup {
-				return nil, fmt.Errorf("pool alias %q already mapped", alias)
-			}
-			models[alias] = pm
+		pm.backends = append(pm.backends, backend)
+		pm.backends[i].model = pm
+		if b.ContextSize > 0 {
+			pm.contextSizes[i].Store(int64(b.ContextSize))
 		}
-	}
-
-	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
-	return &Pool{
-		cfg:         cfg,
-		logger:      logger,
-		models:      models,
-		shutdownCtx: shutdownCtx,
-		shutdownFn:  shutdownFn,
-	}, nil
-}
-
-func newPoolModel(modelID string, mc config.ModelConfig) (*poolModel, error) {
-	pool := mc.Pool
-	if pool.StrategyName() != "sticky_least_inflight" {
-		return nil, fmt.Errorf("model %s: unsupported pool strategy %q", modelID, pool.Strategy)
-	}
-
-	pm := &poolModel{
-		modelID:  modelID,
-		cfg:      mc,
-		rules:    pool.EffectiveAffinityRules(),
-		ttl:      pool.AffinityDuration(),
-		inflight: make([]int, len(pool.Backends)),
-		affinity: make(map[string]affinityEntry),
-	}
-
-	for i, b := range pool.Backends {
-		transport := &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   time.Duration(mc.Timeouts.Connect) * time.Second,
-				KeepAlive: time.Duration(mc.Timeouts.KeepAlive) * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   time.Duration(mc.Timeouts.TLSHandshake) * time.Second,
-			ResponseHeaderTimeout: time.Duration(mc.Timeouts.ResponseHeader) * time.Second,
-			ExpectContinueTimeout: time.Duration(mc.Timeouts.ExpectContinue) * time.Second,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   10,
-			IdleConnTimeout:       time.Duration(mc.Timeouts.IdleConn) * time.Second,
-		}
-
-		target := b.ProxyURL
-		rp := httputil.NewSingleHostReverseProxy(target)
-		rp.Transport = transport
-		rp.ModifyResponse = func(resp *http.Response) error {
-			if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-				resp.Header.Set("X-Accel-Buffering", "no")
-			}
-			return nil
-		}
-		proxyURL := b.Proxy
-		rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			msg := fmt.Sprintf("pool %s backend %s: proxy error: %v", modelID, proxyURL, err)
-			if runtime.GOOS == "darwin" && strings.Contains(err.Error(), "connect: no route to host") {
-				msg += " (hint: on macOS, check System Settings > Privacy & Security > Local Network permissions)"
-			}
-			http.Error(w, msg, http.StatusBadGateway)
-		}
-
-		pm.backends = append(pm.backends, poolBackend{
-			id:           i,
-			proxy:        b.Proxy,
-			reverseProxy: rp,
-		})
 	}
 
 	return pm, nil
+}
+
+func (p *Pool) buildBackend(modelID string, mc config.ModelConfig, i int, b config.PoolBackend, healthTimeout time.Duration) (poolBackend, error) {
+	backend := poolBackend{
+		id:             i,
+		proxy:          b.Proxy,
+		restartOnCrash: mc.Pool.ShouldRestartOnCrash(),
+		healthTimeout:  healthTimeout,
+	}
+	backend.healthy.Store(true)
+
+	if b.IsSpawn() {
+		procID := fmt.Sprintf("%s#%d", modelID, i)
+		checkEndpoint := b.CheckEndpoint
+		if checkEndpoint == "" {
+			checkEndpoint = mc.CheckEndpoint
+		}
+		if checkEndpoint == "" {
+			checkEndpoint = "/health"
+		}
+		cmdStop := b.CmdStop
+		if cmdStop == "" {
+			cmdStop = mc.CmdStop
+		}
+		synth := config.ModelConfig{
+			Cmd:                b.Cmd,
+			CmdStop:            cmdStop,
+			Proxy:              b.Proxy,
+			Env:                append([]string{}, b.Env...),
+			CheckEndpoint:      checkEndpoint,
+			UnloadAfter:        0, // pool sidecars stay warm
+			Timeouts:           mc.Timeouts,
+			HealthCheckTimeout: mc.HealthCheckTimeout,
+		}
+		procLog := logmon.NewWriter(p.upstreamlog)
+		proc, err := process.New(p.procCtx, procID, synth, procLog, p.logger)
+		if err != nil {
+			return poolBackend{}, fmt.Errorf("model %s backend %d: creating process: %w", modelID, i, err)
+		}
+		backend.proc = proc
+		backend.procID = procID
+		// Spawn backends start unhealthy until WaitReady succeeds.
+		backend.healthy.Store(false)
+		return backend, nil
+	}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   time.Duration(mc.Timeouts.Connect) * time.Second,
+			KeepAlive: time.Duration(mc.Timeouts.KeepAlive) * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   time.Duration(mc.Timeouts.TLSHandshake) * time.Second,
+		ResponseHeaderTimeout: time.Duration(mc.Timeouts.ResponseHeader) * time.Second,
+		ExpectContinueTimeout: time.Duration(mc.Timeouts.ExpectContinue) * time.Second,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       time.Duration(mc.Timeouts.IdleConn) * time.Second,
+	}
+
+	target := b.ProxyURL
+	rp := httputil.NewSingleHostReverseProxy(target)
+	rp.Transport = transport
+	rp.ModifyResponse = func(resp *http.Response) error {
+		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+			resp.Header.Set("X-Accel-Buffering", "no")
+		}
+		return nil
+	}
+	proxyURL := b.Proxy
+	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		msg := fmt.Sprintf("pool %s backend %s: proxy error: %v", modelID, proxyURL, err)
+		if runtime.GOOS == "darwin" && strings.Contains(err.Error(), "connect: no route to host") {
+			msg += " (hint: on macOS, check System Settings > Privacy & Security > Local Network permissions)"
+		}
+		http.Error(w, msg, http.StatusBadGateway)
+	}
+	backend.reverseProxy = rp
+	return backend, nil
+}
+
+func (b *poolBackend) kickSupervise(p *Pool) {
+	if b.proc == nil {
+		return
+	}
+	b.supOnce.Do(func() {
+		go b.supervise(p)
+	})
+}
+
+func (b *poolBackend) supervise(p *Pool) {
+	for {
+		if p.shuttingDown.Load() {
+			return
+		}
+		select {
+		case <-p.shutdownCtx.Done():
+			return
+		default:
+		}
+
+		err := b.proc.Run(b.healthTimeout)
+		b.healthy.Store(false)
+		if b.model != nil {
+			b.model.clearAffinityFor(b.id)
+		}
+
+		if p.shuttingDown.Load() {
+			return
+		}
+		if err != nil {
+			p.logger.Warnf("pool: process %s exited: %v", b.procID, err)
+		} else {
+			p.logger.Infof("pool: process %s exited", b.procID)
+		}
+		if !b.restartOnCrash {
+			return
+		}
+		select {
+		case <-p.shutdownCtx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (b *poolBackend) ensureReady(ctx context.Context, p *Pool) error {
+	if b.proc == nil {
+		return nil
+	}
+	b.kickSupervise(p)
+	if err := b.proc.WaitReady(ctx); err != nil {
+		b.healthy.Store(false)
+		return err
+	}
+	b.healthy.Store(true)
+	return nil
+}
+
+func (pm *poolModel) clearAffinityFor(backendID int) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for k, v := range pm.affinity {
+		if v.backendID == backendID {
+			delete(pm.affinity, k)
+		}
+	}
 }
 
 func (p *Pool) Handles(model string) bool {
@@ -147,16 +337,26 @@ func (p *Pool) Handles(model string) bool {
 	return ok
 }
 
+// Preload starts all spawn backends for models with pool.start: preload.
+// Also starts spawn backends when modelID is listed in hooks preload.
+func (p *Pool) Preload(modelID string) {
+	pm, ok := p.models[modelID]
+	if !ok {
+		return
+	}
+	for i := range pm.backends {
+		if pm.backends[i].proc != nil {
+			pm.backends[i].kickSupervise(p)
+		}
+	}
+}
+
 func (p *Pool) Shutdown(timeout time.Duration) error {
 	if !p.shuttingDown.CompareAndSwap(false, true) {
 		return fmt.Errorf("shutdown already in progress")
 	}
 
-	if timeout == 0 {
-		p.shutdownFn()
-		p.inflight.Wait()
-		return nil
-	}
+	p.shutdownFn()
 
 	done := make(chan struct{})
 	go func() {
@@ -164,14 +364,39 @@ func (p *Pool) Shutdown(timeout time.Duration) error {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		return nil
-	case <-time.After(timeout):
-		p.shutdownFn()
-		p.inflight.Wait()
-		return fmt.Errorf("pool shutdown timed out after %v", timeout)
+	if timeout == 0 {
+		<-done
+	} else {
+		select {
+		case <-done:
+		case <-time.After(timeout):
+			p.inflight.Wait()
+		}
 	}
+
+	stopTimeout := timeout
+	if stopTimeout <= 0 {
+		stopTimeout = 15 * time.Second
+	}
+	var wg sync.WaitGroup
+	for _, pm := range p.uniqueModels() {
+		for i := range pm.backends {
+			b := &pm.backends[i]
+			if b.proc == nil {
+				continue
+			}
+			wg.Add(1)
+			go func(proc process.Process, id string) {
+				defer wg.Done()
+				if err := proc.Stop(stopTimeout); err != nil {
+					p.logger.Warnf("pool: stopping %s: %v", id, err)
+				}
+			}(b.proc, b.procID)
+		}
+	}
+	wg.Wait()
+	p.procCancel()
+	return nil
 }
 
 func (p *Pool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -195,12 +420,31 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	affinityKey := ExtractAffinityKey(req, pm.rules)
-	backendID := pm.pickBackend(affinityKey)
-	backend := pm.backends[backendID]
+	reqNctx := extractRequestNctx(req)
+	backendID, err := pm.pickAndTrack(affinityKey, reqNctx)
+	if err != nil {
+		shared.SendError(w, req, err)
+		return
+	}
+	backend := &pm.backends[backendID]
 
-	p.logger.Debugf("pool: model %s affinity=%q backend=%d (%s)", pm.modelID, affinityKey, backendID, backend.proxy)
+	if err := backend.ensureReady(req.Context(), p); err != nil {
+		pm.trackDone(backendID)
+		shared.SendResponse(w, req, http.StatusBadGateway, fmt.Sprintf("pool backend %d not ready: %v", backendID, err))
+		return
+	}
+	if backend.proc != nil {
+		if cs := backend.proc.UpstreamContextLength(); cs > 0 && pm.contextSizes[backendID].Load() == 0 {
+			pm.contextSizes[backendID].Store(int64(cs))
+		}
+	}
 
-	pm.trackStart(backendID)
+	_ = shared.SetReqData(req.Context(), "pool_backend_id", strconv.Itoa(backendID))
+	_ = shared.SetReqData(req.Context(), "pool_backend", backend.proxy)
+
+	p.logger.Debugf("pool: model %s affinity=%q n_ctx=%d backend=%d (%s)",
+		pm.modelID, affinityKey, reqNctx, backendID, backend.proxy)
+
 	defer pm.trackDone(backendID)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -208,14 +452,19 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	stopShutdown := context.AfterFunc(p.shutdownCtx, cancel)
 	req = req.WithContext(ctx)
 
-	backend.reverseProxy.ServeHTTP(w, req)
+	if backend.proc != nil {
+		backend.proc.ServeHTTP(w, req)
+	} else {
+		backend.reverseProxy.ServeHTTP(w, req)
+	}
 
 	stopShutdown()
 	stopReq()
 	cancel()
 }
 
-func (pm *poolModel) pickBackend(affinityKey string) int {
+// pickAndTrack selects an eligible backend and increments its inflight counter.
+func (pm *poolModel) pickAndTrack(affinityKey string, reqNctx int) (int, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -224,24 +473,110 @@ func (pm *poolModel) pickBackend(affinityKey string) int {
 
 	if affinityKey != "" {
 		if entry, ok := pm.affinity[affinityKey]; ok && entry.backendID >= 0 && entry.backendID < len(pm.backends) {
-			pm.affinity[affinityKey] = affinityEntry{backendID: entry.backendID, expires: now.Add(pm.ttl)}
-			return entry.backendID
+			if pm.isRoutableLocked(entry.backendID, reqNctx) {
+				pm.affinity[affinityKey] = affinityEntry{backendID: entry.backendID, expires: now.Add(pm.ttl)}
+				pm.inflight[entry.backendID]++
+				return entry.backendID, nil
+			}
+			delete(pm.affinity, affinityKey)
 		}
 	}
 
-	best := 0
-	bestLoad := pm.inflight[0]
-	for i := 1; i < len(pm.backends); i++ {
-		if pm.inflight[i] < bestLoad {
-			best = i
-			bestLoad = pm.inflight[i]
+	best := pm.pickLeastInflightLocked(reqNctx, true)
+	if best < 0 {
+		best = pm.pickLeastInflightLocked(reqNctx, false)
+	}
+	if best < 0 {
+		// Last resort: any backend that can be started or is static.
+		for i := range pm.backends {
+			if pm.canUseLocked(i) {
+				best = i
+				break
+			}
 		}
+	}
+	if best < 0 {
+		return -1, fmt.Errorf("pool %s: no eligible backends", pm.modelID)
 	}
 
 	if affinityKey != "" {
 		pm.affinity[affinityKey] = affinityEntry{backendID: best, expires: now.Add(pm.ttl)}
 	}
+	pm.inflight[best]++
+	return best, nil
+}
+
+// isRoutableLocked prefers ready/healthy backends that fit context.
+func (pm *poolModel) isRoutableLocked(i int, reqNctx int) bool {
+	if !backendFits(&pm.contextSizes[i], reqNctx) {
+		return false
+	}
+	return pm.isReadyLocked(i)
+}
+
+func (pm *poolModel) isReadyLocked(i int) bool {
+	b := &pm.backends[i]
+	if b.proc != nil {
+		return b.proc.State() == process.StateReady
+	}
+	return b.healthy.Load()
+}
+
+func (pm *poolModel) canUseLocked(i int) bool {
+	b := &pm.backends[i]
+	if b.proc != nil {
+		st := b.proc.State()
+		return st == process.StateReady || st == process.StateStarting || st == process.StateStopped
+	}
+	return true // static: attempt even if marked unhealthy
+}
+
+func (pm *poolModel) pickLeastInflightLocked(reqNctx int, readyOnly bool) int {
+	best := -1
+	bestLoad := int(^uint(0) >> 1)
+	for i := range pm.backends {
+		if !backendFits(&pm.contextSizes[i], reqNctx) {
+			continue
+		}
+		if readyOnly {
+			if !pm.isReadyLocked(i) {
+				continue
+			}
+		} else if !pm.canUseLocked(i) {
+			continue
+		}
+		if pm.inflight[i] < bestLoad {
+			best = i
+			bestLoad = pm.inflight[i]
+		}
+	}
 	return best
+}
+
+func backendFits(cs *atomic.Int64, nctx int) bool {
+	v := int(cs.Load())
+	if v == 0 || nctx <= 0 {
+		return true
+	}
+	return v >= nctx
+}
+
+func extractRequestNctx(r *http.Request) int {
+	if r.Body == nil {
+		return 0
+	}
+	body, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if len(body) == 0 {
+		return 0
+	}
+	if v := gjson.GetBytes(body, "n_ctx"); v.Exists() {
+		n, err := strconv.Atoi(v.String())
+		if err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 func (pm *poolModel) pruneAffinity(now time.Time) {
@@ -252,12 +587,6 @@ func (pm *poolModel) pruneAffinity(now time.Time) {
 	}
 }
 
-func (pm *poolModel) trackStart(id int) {
-	pm.mu.Lock()
-	pm.inflight[id]++
-	pm.mu.Unlock()
-}
-
 func (pm *poolModel) trackDone(id int) {
 	pm.mu.Lock()
 	pm.inflight[id]--
@@ -265,4 +594,174 @@ func (pm *poolModel) trackDone(id int) {
 		pm.inflight[id] = 0
 	}
 	pm.mu.Unlock()
+}
+
+// Stats returns a point-in-time snapshot of every pooled model's backend load.
+func (p *Pool) Stats() shared.PoolMetricsSnapshot {
+	snap := shared.PoolMetricsSnapshot{
+		Timestamp: time.Now(),
+		Models:    make([]shared.PoolModelMetric, 0),
+	}
+	if p == nil || len(p.models) == 0 {
+		return snap
+	}
+
+	unique := make(map[string]*poolModel, len(p.models))
+	for _, pm := range p.models {
+		unique[pm.modelID] = pm
+	}
+	ids := make([]string, 0, len(unique))
+	for id := range unique {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	for _, id := range ids {
+		snap.Models = append(snap.Models, unique[id].stats())
+	}
+	return snap
+}
+
+func (pm *poolModel) stats() shared.PoolModelMetric {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	pm.pruneAffinity(time.Now())
+
+	affinityPerBackend := make([]int, len(pm.backends))
+	for _, entry := range pm.affinity {
+		if entry.backendID >= 0 && entry.backendID < len(pm.backends) {
+			affinityPerBackend[entry.backendID]++
+		}
+	}
+
+	backends := make([]shared.PoolBackendMetric, len(pm.backends))
+	for i, b := range pm.backends {
+		m := shared.PoolBackendMetric{
+			ID:               b.id,
+			Proxy:            b.proxy,
+			Inflight:         pm.inflight[i],
+			ContextSize:      int(pm.contextSizes[i].Load()),
+			AffinitySessions: affinityPerBackend[i],
+			Healthy:          b.healthy.Load(),
+			Kind:             "static",
+		}
+		if b.proc != nil {
+			m.Kind = "spawn"
+			m.State = string(b.proc.State())
+			m.ProcessID = b.procID
+			m.Healthy = b.proc.State() == process.StateReady
+		}
+		backends[i] = m
+	}
+
+	return shared.PoolModelMetric{
+		ModelID:          pm.modelID,
+		Strategy:         pm.cfg.Pool.StrategyName(),
+		Backends:         backends,
+		AffinitySessions: len(pm.affinity),
+	}
+}
+
+func (p *Pool) startMetricsEmitter() {
+	if len(p.models) == 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-p.shutdownCtx.Done():
+				return
+			case <-ticker.C:
+				event.Emit(shared.PoolMetricsUpdateEvent{Snapshot: p.Stats()})
+			}
+		}
+	}()
+}
+
+func (p *Pool) startProber() {
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-p.shutdownCtx.Done():
+				return
+			case <-ticker.C:
+				p.probeBackends()
+			}
+		}
+	}()
+}
+
+func (p *Pool) probeBackends() {
+	for _, pm := range p.uniqueModels() {
+		for i := range pm.backends {
+			b := &pm.backends[i]
+			if b.proc != nil {
+				// Spawn health comes from process state / WaitReady.
+				if b.proc.State() == process.StateReady {
+					b.healthy.Store(true)
+					if cs := b.proc.UpstreamContextLength(); cs > 0 && pm.contextSizes[i].Load() == 0 {
+						pm.contextSizes[i].Store(int64(cs))
+					}
+				} else if b.proc.State() != process.StateStarting {
+					b.healthy.Store(false)
+				}
+				continue
+			}
+			cs, ok := probeBackend(b.proxy, p.shutdownCtx)
+			b.healthy.Store(ok)
+			if ok && pm.contextSizes[i].Load() == 0 && cs > 0 {
+				pm.contextSizes[i].Store(int64(cs))
+				p.logger.Infof("pool: backend %d (%s) auto-detected context size: %d", i, b.proxy, cs)
+			}
+		}
+	}
+}
+
+func probeBackend(proxyURL string, parentCtx context.Context) (contextSize int, ok bool) {
+	target, err := url.Parse(proxyURL)
+	if err != nil {
+		return 0, false
+	}
+	target = target.JoinPath("/props")
+
+	reqCtx, cancel := context.WithTimeout(parentCtx, 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return 0, false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, false
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return 0, false
+	}
+
+	v := gjson.GetBytes(body, "default_generation_settings.n_ctx")
+	if !v.Exists() {
+		v = gjson.GetBytes(body, "n_ctx")
+	}
+	if n, err := strconv.Atoi(v.String()); err == nil && n > 0 {
+		return n, true
+	}
+	return 0, true
+}
+
+func probeContextSize(proxyURL string, parentCtx context.Context) int {
+	cs, _ := probeBackend(proxyURL, parentCtx)
+	return cs
 }

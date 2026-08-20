@@ -148,6 +148,17 @@ admin:
   # keysFile: path for UI-created API keys (bcrypt hashes). Default: llama-swap-keys.json
   # keysFile: /var/lib/llama-swap/keys.json
 
+# http: reverse-proxy trust settings (nginx, Caddy, etc.)
+# - optional
+# - when the peer is trusted, X-Forwarded-Proto / X-Forwarded-For / X-Real-IP
+#   are honored (Secure cookies + real client IPs in access logs)
+# - default trustedProxies: 127.0.0.0/8 and ::1 (same-host nginx)
+# http:
+#   trustedProxies:
+#     - 127.0.0.1/32
+#     - ::1/128
+#     # - 10.0.0.0/8   # only if nginx runs elsewhere and can reach llama-swap
+
 # models: a dictionary of model configurations
 # - required
 # - each key is the model's ID, used in API requests
@@ -357,8 +368,8 @@ models:
       # - must be an integer > 0
       context: 32000
 
-  # Pool example: load balance across always-on llama-server instances
-  # - no cmd / swapping; see docs/pool-and-auth.md
+  # Pool example: load balance across always-on or spawnable backends
+  # - see docs/pool-and-auth.md
   "llama-pooled":
     name: "Llama 70B (pooled)"
     pool:
@@ -374,6 +385,19 @@ models:
       #   - json: user
       #   - header: X-Conversation-Id
       #   - apiKey: true
+
+  # Spawnable pool: llama-swap starts one process per GPU and load-balances
+  # "whisper-pooled":
+  #   capabilities:
+  #     in: [audio]
+  #     out: [text]
+  #   pool:
+  #     start: preload
+  #     backends:
+  #       - cmd: whisper-server --port ${PORT} -m /models/whisper.bin
+  #         env: ["CUDA_VISIBLE_DEVICES=0"]
+  #       - cmd: whisper-server --port ${PORT} -m /models/whisper.bin
+  #         env: ["CUDA_VISIBLE_DEVICES=1"]
 
   # Unlisted model example:
   "qwen-unlisted":

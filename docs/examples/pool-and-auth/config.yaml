@@ -1,0 +1,132 @@
+# Pool + auth gateway configuration
+# ==================================
+#
+# A complete example of running llama-swap as a gateway in front of
+# multiple always-on inference servers with authentication.
+#
+# Topology:
+#
+#   Client ──► llama-swap (this config)
+#                     │
+#              ┌──────┼──────────┐
+#              ▼      ▼          ▼
+#           GPU-1   GPU-2     GPU-3
+#         (3x P40) (3x P40)  (3x P40)
+#
+# All three nodes run the same models. llama-swap spreads new sessions
+# across nodes and sticks follow-ups to the same backend so the KV
+# cache stays warm.
+
+# ── Admin login (dashboard) ──────────────────────────────────────
+
+admin:
+  # Protects /ui and /api. Login page appears when this is set.
+  password: "${env.LLAMASWAP_ADMIN_PASSWORD}"
+
+  # How long the admin session lasts. Default: 24h
+  sessionTTL: 12h
+
+  # Where UI-created inference keys are stored (bcrypt hashes).
+  # Default: llama-swap-keys.json
+  keysFile: /var/lib/llama-swap/keys.json
+
+# ── Inference API keys ───────────────────────────────────────────
+
+# Static keys checked on every /v1/* request. Clients send these as
+# Authorization: Bearer <key> or x-api-key: <key>.
+apiKeys:
+  - "${env.INFERENCE_API_KEY}"
+
+# UI-managed keys (created from /ui/#/keys) are checked in addition
+# to the static keys above. They are prefixed sk-ls- and stored
+# hashed in admin.keysFile.
+
+# ── Models ────────────────────────────────────────────────────────
+
+models:
+  # ── Pooled: Llama 70B across 3 GPU nodes ──────────────────────
+  "llama-70b":
+    name: "Meta Llama 3.1 70B"
+    description: "70B instruction model — load balanced across 3 nodes"
+
+    pool:
+      # Strategy is sticky_least_inflight by default (the only one).
+      # New affinity keys go to the backend with the fewest active
+      # requests. Existing keys always hit the same backend.
+      strategy: sticky_least_inflight
+
+      # How long to keep an affinity mapping after the last request.
+      # Default: 30m
+      affinityTTL: 1h
+
+      backends:
+        # Each backend runs its own llama-server process.
+        # Use contextSize to tell llama-swap the max context the backend
+        # supports — requests that need more tokens skip that backend.
+        - proxy: http://192.168.1.101:8080
+          contextSize: 32000
+        - proxy: http://192.168.1.102:8080
+          contextSize: 32000
+        - proxy: http://192.168.1.103:8080
+          contextSize: 64000   # this node has more VRAM
+
+      # Default affinity rules try these in order; first non-empty wins:
+      #   JSON id_slot → previous_response_id → conversation.id →
+      #   prompt_cache_key → user → metadata.user_id →
+      #   metadata.session_id → metadata.conversation_id →
+      #   header X-Conversation-Id → X-Session-Id → API key
+      #
+      # Uncomment to override (e.g. stick strictly by API key):
+      #
+      # affinity:
+      #   - apiKey: true
+
+    # Force cache_prompt on every request so backends keep KV caches warm.
+    filters:
+      setParams:
+        cache_prompt: true
+
+  # ── Pooled: smaller model for fast responses ───────────────────
+  "llama-8b":
+    name: "Meta Llama 3.1 8B"
+    pool:
+      affinityTTL: 45m
+      backends:
+        - proxy: http://192.168.1.101:8081
+        - proxy: http://192.168.1.102:8081
+        - proxy: http://192.168.1.103:8081
+
+  # ── Pooled: embeddings service ─────────────────────────────────
+  "embeddings":
+    name: "Text Embeddings"
+    pool:
+      backends:
+        - proxy: http://192.168.1.101:8082
+        - proxy: http://192.168.1.102:8082
+      # Embeddings requests are independent — stick by API key only
+      # so every request load-balances unless the same key is used.
+      affinity:
+        - apiKey: true
+
+  # ── Local model: loaded/swapped by llama-swap ──────────────────
+  # Mixed with pool models — this one is managed locally and swaps
+  # on demand. Pool dispatch takes priority, then local, then peer.
+  "local-tool":
+    cmd: >
+      /opt/llama.cpp/llama-server
+      --port ${PORT}
+      --model /models/ToolModel-Q4.gguf
+      -ngl 99
+    proxy: "http://127.0.0.1:${PORT}"
+
+# ── Scheduler priority ───────────────────────────────────────────
+# Higher-priority local models jump the queue when swapping.
+# Does not affect pool models (they are always ready).
+
+routing:
+  scheduler:
+    use: fifo
+    settings:
+      fifo:
+        priority:
+          local-tool: 5

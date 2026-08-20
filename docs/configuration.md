@@ -74,7 +74,7 @@ llama-swap supports many more features to customize how you want to manage your 
 
 | Feature   | Description                                    |
 | --------- | ---------------------------------------------- |
-| `pool`    | load balance always-on backends (see [pool-and-auth.md](pool-and-auth.md)) |
+| `pool`    | load balance static and/or spawnable backends (see [pool-and-auth.md](pool-and-auth.md)) |
 | `admin`   | dashboard login and UI-managed API keys (see [pool-and-auth.md](pool-and-auth.md)) |
 | `ttl`     | automatic unloading of models after a timeout  |
 | `macros`  | reusable snippets to use in configurations     |
@@ -422,8 +422,8 @@ models:
       tlsHandshake: 10
       idleConn: 90
 
-  # Pool example: load balance across always-on llama-server instances
-  # - no cmd / swapping; see docs/pool-and-auth.md
+  # Pool example: load balance across always-on or spawnable backends
+  # - see docs/pool-and-auth.md
   "llama-pooled":
     name: "Llama 70B (pooled)"
     pool:
@@ -433,6 +433,22 @@ models:
         - proxy: http://192.168.1.101:8080
         - proxy: http://192.168.1.102:8080
         - proxy: http://192.168.1.103:8080
+
+  # Spawnable pool: one model name, N GPUs started by llama-swap
+  "whisper-pooled":
+    name: "Whisper (3 GPUs)"
+    capabilities:
+      in: [audio]
+      out: [text]
+    pool:
+      start: preload
+      backends:
+        - cmd: whisper-server --port ${PORT} -m /models/whisper.bin
+          env: ["CUDA_VISIBLE_DEVICES=0"]
+        - cmd: whisper-server --port ${PORT} -m /models/whisper.bin
+          env: ["CUDA_VISIBLE_DEVICES=1"]
+        - cmd: whisper-server --port ${PORT} -m /models/whisper.bin
+          env: ["CUDA_VISIBLE_DEVICES=2"]
 
   # Unlisted model example:
   "qwen-unlisted":

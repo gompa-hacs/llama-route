@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { fetchPerformance } from "../stores/api";
+  import { fetchPerformance, fetchPeerMetrics, fetchPoolMetrics, poolMetrics } from "../stores/api";
   import { persistentStore } from "../stores/persistent";
-  import type { SysStat, GpuStat } from "../lib/types";
+  import type { SysStat, GpuStat, PeerSnapshot, PoolMetricsSnapshot } from "../lib/types";
   import PerformanceChart from "../components/PerformanceChart.svelte";
 
   const COLORS = [
@@ -44,6 +44,26 @@
   let gpuData = $state<GpuStat[]>([]);
   let refreshing = $state(false);
 
+  let peerData = $state<Record<string, PeerSnapshot>>({});
+  let peerPollTime = $state<string>("");
+
+  let poolData = $state<PoolMetricsSnapshot | null>(null);
+
+  async function loadPeerData() {
+    const resp = await fetchPeerMetrics();
+    if (resp) {
+      peerData = resp.peers ?? {};
+      peerPollTime = resp.poll_time ?? "";
+    }
+  }
+
+  async function loadPoolData() {
+    const resp = await fetchPoolMetrics();
+    if (resp) {
+      poolData = resp;
+    }
+  }
+
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let visible = $state(true);
   let mounted = $state(false);
@@ -77,6 +97,7 @@
       sysData = resp.sys_stats ?? [];
       gpuData = resp.gpu_stats ?? [];
     }
+    await loadPoolData();
   }
 
   async function loadIncremental() {
@@ -92,6 +113,7 @@
         gpuData = [...gpuData, ...newGpu];
       }
     }
+    await loadPoolData();
   }
 
   function startPolling() {
@@ -144,10 +166,16 @@
     mounted = true;
     document.addEventListener("visibilitychange", handleVisibility);
     loadAll().then(() => startPolling());
+    loadPeerData();
+
+    const unsubPool = poolMetrics.subscribe((snap) => {
+      if (snap) poolData = snap;
+    });
 
     return () => {
       mounted = false;
       stopPolling();
+      unsubPool();
       document.removeEventListener("visibilitychange", handleVisibility);
     };
   });
@@ -508,4 +536,83 @@
       {/if}
     </div>
   </section>
+
+  <!-- Pool Backend Load Section -->
+  {#if poolData?.models?.length}
+    <section class="space-y-4">
+      <h3 class="text-lg font-medium text-txtmain">Pool Backends</h3>
+      <p class="text-sm text-txtsecondary">
+        Live load-balancer state for always-on upstream backends. Updated: {poolData.timestamp ? new Date(poolData.timestamp).toLocaleTimeString() : "never"}.
+      </p>
+      {#each poolData.models as model}
+        <div class="space-y-2">
+          <div class="flex items-baseline gap-2">
+            <h4 class="font-medium text-txtmain">{model.model_id}</h4>
+            <span class="text-xs text-txtsecondary">{model.strategy} · {model.affinity_sessions} sticky session{model.affinity_sessions === 1 ? "" : "s"}</span>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {#each model.backends as backend}
+              <div class="card p-4 space-y-2">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-medium text-txtmain truncate" title={backend.proxy}>#{backend.id} {backend.proxy}</span>
+                  <span class="text-xs px-2 py-0.5 rounded-full shrink-0" class:bg-green-900={backend.healthy} class:text-green-300={backend.healthy} class:bg-red-900={!backend.healthy} class:text-red-300={!backend.healthy}>
+                    {backend.healthy ? "healthy" : "down"}
+                  </span>
+                </div>
+                <div class="text-xs text-txtsecondary space-y-1">
+                  <p>Kind: {backend.kind ?? "static"}{#if backend.state} · {backend.state}{/if}</p>
+                  <p>In-flight: {backend.inflight}</p>
+                  <p>Sticky sessions: {backend.affinity_sessions}</p>
+                  <p>Context size: {backend.context_size > 0 ? backend.context_size.toLocaleString() : "unknown"}</p>
+                </div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/each}
+    </section>
+  {/if}
+
+  <!-- Peer Performance Section -->
+  {#if Object.keys(peerData).length > 0}
+    <section class="space-y-4">
+      <h3 class="text-lg font-medium text-txtmain">Peers</h3>
+      <p class="text-sm text-txtsecondary">
+        Metrics aggregated from upstream llama-swap sidecars. Last poll: {peerPollTime ? new Date(peerPollTime).toLocaleTimeString() : "never"}.
+      </p>
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {#each Object.entries(peerData) as [, peer]}
+          <div class="card p-4 space-y-3">
+            <div class="flex items-center justify-between">
+              <span class="font-medium text-txtmain">{peer.peer_name}</span>
+              <span class="text-xs px-2 py-0.5 rounded-full" class:bg-green-900={peer.success} class:text-green-300={peer.success} class:bg-red-900={!peer.success} class:text-red-300={!peer.success}>
+                {peer.success ? "connected" : "error"}
+              </span>
+            </div>
+            {#if peer.error}
+              <p class="text-xs text-red-400">{peer.error}</p>
+            {/if}
+            {#if peer.sys_stats?.length > 0}
+              {@const latest = peer.sys_stats[peer.sys_stats.length - 1]}
+              <div class="text-xs text-txtsecondary space-y-1">
+                <p>CPU: {latest.cpu_util_per_core[0]?.toFixed(1) ?? "?"}%</p>
+                <p>RAM: {((latest.mem_used_mb / latest.mem_total_mb) * 100).toFixed(1)}% ({latest.mem_used_mb} / {latest.mem_total_mb} MB)</p>
+                <p>Load: {latest.load_avg_1.toFixed(2)} / {latest.load_avg_5.toFixed(2)} / {latest.load_avg_15.toFixed(2)}</p>
+              </div>
+            {/if}
+            {#if peer.gpu_stats?.length > 0}
+              <div class="text-xs text-txtsecondary space-y-1">
+                {#each peer.gpu_stats as gpu}
+                  <p>{gpu.name}: {gpu.gpu_util_pct.toFixed(1)}% util, {gpu.temp_c}°C, {((gpu.mem_used_mb / gpu.mem_total_mb) * 100).toFixed(1)}% VRAM</p>
+                {/each}
+              </div>
+            {/if}
+            {#if peer.metrics}
+              <p class="text-xs text-txtsecondary">{peer.metrics.length} requests recorded</p>
+            {/if}
+          </div>
+        {/each}
+      </div>
+    </section>
+  {/if}
 </div>

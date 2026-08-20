@@ -124,3 +124,85 @@ func TestServer_AuthMiddleware(t *testing.T) {
 		}
 	})
 }
+
+func TestServer_AdminAuthMiddleware_SessionOnly(t *testing.T) {
+	final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	cfg := config.Config{
+		RequiredAPIKeys: []string{"infer-key"},
+		Admin:           config.AdminConfig{Password: "admin-pass"},
+	}
+	mgr, err := auth.NewManager(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mw := CreateAdminAuthMiddleware(mgr)
+
+	t.Run("inference key alone is rejected", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodGet, "/api/metrics", nil)
+		r.Header.Set("Authorization", "Bearer infer-key")
+		w := httptest.NewRecorder()
+		mw(final).ServeHTTP(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", w.Code)
+		}
+	})
+
+	t.Run("session cookie is accepted", func(t *testing.T) {
+		token, _, err := mgr.Login("admin-pass")
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodGet, "/api/metrics", nil)
+		r.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: token})
+		w := httptest.NewRecorder()
+		mw(final).ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+	})
+}
+
+func TestServer_StripClientAuthMiddleware(t *testing.T) {
+	var sawAuth, sawKey string
+	final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuth = r.Header.Get("Authorization")
+		sawKey = r.Header.Get("X-Api-Key")
+		w.WriteHeader(http.StatusOK)
+	})
+	mw := CreateStripClientAuthMiddleware()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	r.Header.Set("Authorization", "Bearer secret")
+	r.Header.Set("X-Api-Key", "secret")
+	mw(final).ServeHTTP(httptest.NewRecorder(), r)
+	if sawAuth != "" || sawKey != "" {
+		t.Fatalf("upstream still saw auth headers: Authorization=%q X-Api-Key=%q", sawAuth, sawKey)
+	}
+}
+
+func TestServer_AuthLogin_SecureCookieBehindProxy(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	mgr, err := auth.NewManager(config.Config{Admin: config.AdminConfig{Password: "pw"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.auth = mgr
+
+	r := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"pw"}`))
+	r.Header.Set("Content-Type", "application/json")
+	r.RemoteAddr = "127.0.0.1:1234"
+	r.Header.Set("X-Forwarded-Proto", "https")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("expected session cookie")
+	}
+	if !cookies[0].Secure {
+		t.Fatal("expected Secure cookie when X-Forwarded-Proto=https from trusted proxy")
+	}
+}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
@@ -319,13 +320,29 @@ func (d *discardResponseWriter) WriteHeader(status int) { d.status = status }
 // Preload names are already resolved to real model IDs by config loading.
 func (s *Server) startPreload() {
 	models := s.cfg.Hooks.OnStartup.Preload
-	if len(models) == 0 {
-		return
-	}
 	go func() {
+		// Always preload pool models configured with pool.start: preload.
+		if pool, ok := s.pool.(*router.Pool); ok && pool != nil {
+			for id, mc := range s.cfg.Models {
+				if mc.UsesPool() && mc.Pool.StartMode() == "preload" {
+					s.proxylog.Infof("preloading pool model: %s", id)
+					pool.Preload(id)
+				}
+			}
+		}
+
+		if len(models) == 0 {
+			return
+		}
 		for _, modelID := range models {
+			if pool, ok := s.pool.(*router.Pool); ok && pool != nil && pool.Handles(modelID) {
+				s.proxylog.Infof("preloading pool model: %s", modelID)
+				pool.Preload(modelID)
+				event.Emit(shared.ModelPreloadedEvent{ModelName: modelID, Success: true})
+				continue
+			}
 			if !s.local.Handles(modelID) {
-				s.proxylog.Warnf("preload: model %s is not a local model, skipping", modelID)
+				s.proxylog.Warnf("preload: model %s is not a local or pool model, skipping", modelID)
 				continue
 			}
 			s.proxylog.Infof("preloading model: %s", modelID)

@@ -102,15 +102,16 @@ type ModelConfig struct {
 	// Capabilities defines what modalities and features the model supports.
 	Capabilities ModelCapConfig `yaml:"capabilities"`
 
-	// Pool routes requests to always-on upstream backends with load balancing.
-	// When set, cmd/process swapping is not used for this model.
+	// Pool routes requests across backends with sticky least-inflight LB.
+	// Backends may be static proxy URLs or spawnable sidecars (cmd).
+	// When set, model-level cmd/process swapping is not used for this model.
 	Pool *PoolConfig `yaml:"pool"`
 
 	// Copy of HealthCheckTimeout from global config
 	HealthCheckTimeout int `yaml:"healthCheckTimeout"`
 }
 
-// UsesPool reports whether this model is served by a static backend pool.
+// UsesPool reports whether this model is served by a backend pool.
 func (m *ModelConfig) UsesPool() bool {
 	return m.Pool != nil && len(m.Pool.Backends) > 0
 }

@@ -105,8 +105,56 @@ export interface PerformanceResponse {
   gpu_stats: GpuStat[];
 }
 
+export interface PeerMetricEntry {
+  peer_name: string;
+  model: string;
+  timestamp: string;
+  req_path: string;
+  tokens: Record<string, number>;
+  duration_ms: number;
+}
+
+export interface PeerSnapshot {
+  peer_name: string;
+  success: boolean;
+  error?: string;
+  metrics?: PeerMetricEntry[];
+  sys_stats: SysStat[];
+  gpu_stats: GpuStat[];
+  last_seen: string;
+}
+
+export interface PeerMetricsResponse {
+  poll_time: string;
+  peers: Record<string, PeerSnapshot>;
+}
+
+export interface PoolBackendMetric {
+  id: number;
+  proxy: string;
+  inflight: number;
+  context_size: number;
+  affinity_sessions: number;
+  healthy: boolean;
+  kind?: string;
+  state?: string;
+  process_id?: string;
+}
+
+export interface PoolModelMetric {
+  model_id: string;
+  strategy: string;
+  backends: PoolBackendMetric[];
+  affinity_sessions: number;
+}
+
+export interface PoolMetricsSnapshot {
+  timestamp: string;
+  models: PoolModelMetric[];
+}
+
 export interface APIEventEnvelope {
-  type: "modelStatus" | "logData" | "metrics" | "inflight" | "perfsys" | "perfgpu";
+  type: "modelStatus" | "logData" | "metrics" | "inflight" | "peerMetrics" | "poolMetrics";
   data: string;
 }
 

@@ -22,6 +22,11 @@ func ExtractAffinityKey(r *http.Request, rules []config.AffinityRule) string {
 
 	body := peekRequestBody(r)
 	apiKey := shared.ExtractAPIKey(r)
+	if apiKey == "" {
+		if data, ok := shared.ReadContext(r.Context()); ok {
+			apiKey = data.ApiKey
+		}
+	}
 
 	for _, rule := range rules {
 		switch {

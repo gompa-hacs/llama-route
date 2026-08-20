@@ -480,6 +480,25 @@
             "default": [],
             "description": "Require an API key when making requests to inference endpoints. When empty, authorization will not be checked. Each key is a non-empty string."
         },
+        "http": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Reverse-proxy trust settings. When the peer is trusted, X-Forwarded-Proto / X-Forwarded-For / X-Real-IP are honored.",
+            "properties": {
+                "trustedProxies": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "default": [
+                        "127.0.0.0/8",
+                        "::1/128"
+                    ],
+                    "description": "IP addresses or CIDR ranges allowed to set forwarded headers. Defaults to loopback for same-host nginx."
+                }
+            }
+        },
         "peers": {
             "type": "object",
             "additionalProperties": {

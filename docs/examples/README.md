@@ -4,4 +4,6 @@ A collections of usecases and examples for getting the most out of llama-swap.
 
 * [Speculative Decoding](speculative-decoding/README.md) - using a small draft model can increase inference speeds from 20% to 40%. This example includes a configurations Qwen2.5-Coder-32B (2.5x increase) and Llama-3.1-70B (1.4x increase) in the best cases.
 * [Optimizing Code Generation](benchmark-snakegame/README.md) - find the optimal settings for your machine. This example demonstrates defining multiple configurations and testing which one is fastest.
-* [Pool load balancing and authentication](../pool-and-auth.md) - route one model name across multiple always-on llama.cpp servers with sticky sessions, plus dashboard login and UI API key management.
+* [Pool load balancing and authentication guide](../pool-and-auth.md) - conceptual guide covering pool routing, sticky affinity, and auth layers.
+* [Pool load balancing and authentication example](pool-and-auth/README.md) - complete working config with admin login, API keys, multi-node pools, and mixed local+pool models.
+* [nginx reverse proxy](nginx/README.md) - TLS, rate limits, and localhost binding for internet-facing personal use.

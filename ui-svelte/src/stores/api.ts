@@ -8,6 +8,9 @@ import type {
   ReqRespCapture,
   InFlightStats,
   PerformanceResponse,
+  PeerMetricsResponse,
+  PeerMetricEntry,
+  PoolMetricsSnapshot,
 } from "../lib/types";
 import { connectionState } from "./theme";
 import { authFetch } from "./auth";
@@ -20,6 +23,8 @@ export const proxyLogs = writable<string>("");
 export const upstreamLogs = writable<string>("");
 export const metrics = writable<ActivityLogEntry[]>([]);
 export const inFlightRequests = writable<number>(0);
+export const peerMetrics = writable<PeerMetricEntry[]>([]);
+export const poolMetrics = writable<PoolMetricsSnapshot | null>(null);
 export const versionInfo = writable<VersionInfo>({
   build_date: "unknown",
   commit: "unknown",
@@ -99,6 +104,16 @@ export function enableAPIEvents(enabled: boolean): void {
           case "inflight": {
             const stats = JSON.parse(message.data) as InFlightStats;
             inFlightRequests.set(stats.total ?? 0);
+            break;
+          }
+          case "peerMetrics": {
+            const newPeerMetrics = JSON.parse(message.data) as PeerMetricEntry[];
+            peerMetrics.set(newPeerMetrics);
+            break;
+          }
+          case "poolMetrics": {
+            const snapshot = JSON.parse(message.data) as PoolMetricsSnapshot;
+            poolMetrics.set(snapshot);
             break;
           }
         }
@@ -221,6 +236,32 @@ export async function fetchPerformance(after?: string): Promise<PerformanceRespo
     return await response.json();
   } catch (error) {
     console.error("Failed to fetch performance data:", error);
+    return null;
+  }
+}
+
+export async function fetchPeerMetrics(): Promise<PeerMetricsResponse | null> {
+  try {
+    const response = await authFetch("/api/peer-metrics");
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Failed to fetch peer metrics data:", error);
+    return null;
+  }
+}
+
+export async function fetchPoolMetrics(): Promise<PoolMetricsSnapshot | null> {
+  try {
+    const response = await authFetch("/api/pool-metrics");
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Failed to fetch pool metrics data:", error);
     return null;
   }
 }

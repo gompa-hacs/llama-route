@@ -85,23 +85,33 @@ func TestServer_HandleLogs_HTMLRedirect(t *testing.T) {
 }
 
 func TestServer_ClientIP(t *testing.T) {
+	httpCfg := &config.HTTPConfig{} // Trusts() defaults to loopback
+
 	cases := []struct {
-		name  string
-		setup func(*http.Request)
-		want  string
+		name       string
+		remoteAddr string
+		setup      func(*http.Request)
+		want       string
 	}{
-		{"remote addr", func(r *http.Request) { r.RemoteAddr = "10.0.0.5:1234" }, "10.0.0.5"},
-		{"x-forwarded-for", func(r *http.Request) {
+		{"remote addr", "10.0.0.5:1234", nil, "10.0.0.5"},
+		{"xff from trusted proxy", "127.0.0.1:1234", func(r *http.Request) {
 			r.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
 		}, "1.2.3.4"},
-		{"x-real-ip", func(r *http.Request) { r.Header.Set("X-Real-IP", "9.9.9.9") }, "9.9.9.9"},
+		{"xff ignored from untrusted", "10.0.0.5:1234", func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", "1.2.3.4")
+		}, "10.0.0.5"},
+		{"x-real-ip from trusted proxy", "127.0.0.1:1234", func(r *http.Request) {
+			r.Header.Set("X-Real-IP", "9.9.9.9")
+		}, "9.9.9.9"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodGet, "/", nil)
-			r.RemoteAddr = ""
-			c.setup(r)
-			if got := clientIP(r); got != c.want {
+			r.RemoteAddr = c.remoteAddr
+			if c.setup != nil {
+				c.setup(r)
+			}
+			if got := clientIP(r, httpCfg); got != c.want {
 				t.Errorf("clientIP() = %q, want %q", got, c.want)
 			}
 		})
@@ -114,7 +124,7 @@ func TestServer_RequestLogMiddleware(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		w.Write([]byte("hello"))
 	})
-	mw := CreateRequestLogMiddleware(proxylog)
+	mw := CreateRequestLogMiddleware(proxylog, nil)
 
 	t.Run("logs request", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -132,7 +142,7 @@ func TestServer_RequestLogMiddleware(t *testing.T) {
 	for _, path := range []string{"/wol-health", "/api/performance", "/metrics"} {
 		t.Run("skips "+path, func(t *testing.T) {
 			skipLog := logmon.NewWriter(io.Discard)
-			skipMW := CreateRequestLogMiddleware(skipLog)
+			skipMW := CreateRequestLogMiddleware(skipLog, nil)
 			skipMW(final).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
 			if len(skipLog.GetHistory()) != 0 {
 				t.Errorf("%s should not be logged; got %q", path, skipLog.GetHistory())
@@ -183,7 +193,7 @@ func TestServer_RequestLogMiddleware_WebSocketUpgrade(t *testing.T) {
 	// Front server: ReverseProxy wrapped in the access-log middleware, which is
 	// the production statusRecorder-wrapped path.
 	proxy := httputil.NewSingleHostReverseProxy(upstreamURL)
-	mw := CreateRequestLogMiddleware(logmon.NewWriter(io.Discard))
+	mw := CreateRequestLogMiddleware(logmon.NewWriter(io.Discard), nil)
 	front := httptest.NewServer(mw(proxy))
 	defer front.Close()
 

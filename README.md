@@ -232,27 +232,44 @@ In the most basic configuration llama-swap handles one model at a time. For more
 
 ## Reverse Proxy Configuration (nginx)
 
-If you deploy llama-swap behind nginx, disable response buffering for streaming endpoints. By default, nginx buffers responses which breaks Server‑Sent Events (SSE) and streaming chat completion. ([#236](https://github.com/mostlygeek/llama-swap/issues/236))
+For internet-facing or TLS deployments, bind llama-swap to localhost and put
+nginx in front. A full personal-use example (TLS, rate limits, SSE, auth) is in
+[`docs/examples/nginx/`](docs/examples/nginx/).
 
-Recommended nginx configuration snippets:
+```bash
+llama-swap --config config.yaml --listen localhost:8080
+```
+
+At minimum, disable response buffering for streaming endpoints. By default,
+nginx buffers responses which breaks Server‑Sent Events (SSE) and streaming
+chat completion. ([#236](https://github.com/mostlygeek/llama-swap/issues/236))
 
 ```nginx
 # SSE for UI events/logs
 location /api/events {
-    proxy_pass http://your-llama-swap-backend;
+    proxy_pass http://127.0.0.1:8080;
     proxy_buffering off;
     proxy_cache off;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 
 # Streaming chat completions (stream=true)
-location /v1/chat/completions {
-    proxy_pass http://your-llama-swap-backend;
+location /v1/ {
+    proxy_pass http://127.0.0.1:8080;
     proxy_buffering off;
     proxy_cache off;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 ```
 
-As a safeguard, llama-swap also sets `X-Accel-Buffering: no` on SSE responses. However, explicitly disabling `proxy_buffering` at your reverse proxy is still recommended for reliable streaming behavior.
+As a safeguard, llama-swap also sets `X-Accel-Buffering: no` on SSE responses.
+Explicitly disabling `proxy_buffering` is still recommended. When nginx sends
+`X-Forwarded-Proto: https` from a trusted proxy (loopback by default), admin
+session cookies are marked `Secure`.
 
 ## Monitoring Logs on the CLI
 

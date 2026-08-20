@@ -47,6 +47,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   shared.IsHTTPS(r, s.cfg.HTTP.Trusts),
 		SameSite: http.SameSiteLaxMode,
 		Expires:  exp,
 	})
@@ -62,6 +63,8 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   shared.IsHTTPS(r, s.cfg.HTTP.Trusts),
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
 	w.WriteHeader(http.StatusNoContent)

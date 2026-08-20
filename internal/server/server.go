@@ -14,6 +14,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/peermetrics"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/shared"
@@ -29,10 +30,11 @@ type Server struct {
 	proxylog    *logmon.Monitor
 	upstreamlog *logmon.Monitor
 
-	perf     *perf.Monitor
-	inflight *inflightCounter
-	metrics  *metricsMonitor
-	build    BuildInfo
+	perf        *perf.Monitor
+	inflight    *inflightCounter
+	metrics     *metricsMonitor
+	peerMetrics *peermetrics.Fetcher
+	build       BuildInfo
 
 	local router.LocalRouter
 	peer  router.Router
@@ -146,7 +148,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		return nil, fmt.Errorf("creating peer router: %w", err)
 	}
 
-	pool, err := router.NewPool(cfg, proxylog)
+	pool, err := router.NewPool(cfg, proxylog, upstreamlog)
 	if err != nil {
 		return nil, fmt.Errorf("creating pool router: %w", err)
 	}
@@ -160,6 +162,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		perf:        perfMon,
 		inflight:    &inflightCounter{},
 		metrics:     newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer),
+		peerMetrics: peermetrics.NewFetcher(cfg.Peers, peermetrics.DefaultFetcherConfig(), proxylog),
 		build:       build,
 		local:       local,
 		peer:        peer,
@@ -170,6 +173,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	}
 	s.routes()
 	s.startPreload()
+	s.peerMetrics.Start(s.shutdownCtx)
 	return s, nil
 }
 
@@ -217,6 +221,7 @@ func (s *Server) routes() {
 	modelChain := chain.New(
 		inferenceAuth,
 		CreateRequestContextMiddleware(s.cfg),
+		CreateStripClientAuthMiddleware(),
 		CreateFilterMiddleware(s.cfg),
 		CreateFormFilterMiddleware(s.cfg),
 		CreateInflightMiddleware(s.inflight),
@@ -261,7 +266,10 @@ func (s *Server) routes() {
 	mux.Handle("GET /unload", dashboardChain.ThenFunc(s.handleUnload))
 	mux.Handle("GET /running", dashboardChain.ThenFunc(s.handleRunning))
 
-	upstreamChain := dashboardChain.Append(CreateMetricsMiddleware(s.metrics, s.cfg))
+	upstreamChain := dashboardChain.Append(
+		CreateStripClientAuthMiddleware(),
+		CreateMetricsMiddleware(s.metrics, s.cfg),
+	)
 	mux.HandleFunc("GET /upstream", handleUpstreamRedirect)
 	mux.Handle("/upstream/{upstreamPath...}", upstreamChain.ThenFunc(s.handleUpstream))
 
@@ -270,6 +278,8 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/events", dashboardChain.ThenFunc(s.handleAPIEvents))
 	mux.Handle("GET /api/metrics", dashboardChain.ThenFunc(s.handleAPIMetrics))
 	mux.Handle("GET /api/performance", dashboardChain.ThenFunc(s.handleAPIPerformance))
+	mux.Handle("GET /api/peer-metrics", dashboardChain.ThenFunc(s.handleAPIPeerMetrics))
+	mux.Handle("GET /api/pool-metrics", dashboardChain.ThenFunc(s.handleAPIPoolMetrics))
 	mux.Handle("GET /api/version", dashboardChain.ThenFunc(s.handleAPIVersion))
 	mux.Handle("GET /api/captures/{id}", dashboardChain.ThenFunc(s.handleAPICapture))
 	mux.Handle("GET /api/admin/keys", dashboardChain.ThenFunc(s.handleAdminListKeys))
@@ -277,7 +287,7 @@ func (s *Server) routes() {
 	mux.Handle("DELETE /api/admin/keys/{id}", dashboardChain.ThenFunc(s.handleAdminRevokeKey))
 
 	s.mux = mux
-	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware()).Then(mux)
+	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog, &s.cfg.HTTP), CreateCORSMiddleware()).Then(mux)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -303,6 +313,9 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 		return nil
 	}
 	s.shutdownFn()
+	if s.peerMetrics != nil {
+		s.peerMetrics.Stop()
+	}
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex

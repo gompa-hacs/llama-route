@@ -166,6 +166,9 @@ type Config struct {
 
 	// admin configures dashboard login and UI-managed API keys.
 	Admin AdminConfig `yaml:"admin"`
+
+	// HTTP configures reverse-proxy trust (X-Forwarded-* headers).
+	HTTP HTTPConfig `yaml:"http"`
 }
 
 // RoutingConfig is the canonical, normalized routing/scheduling configuration.
@@ -392,12 +395,19 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 
 			if modelConfig.Pool != nil {
 				for i := range modelConfig.Pool.Backends {
-					modelConfig.Pool.Backends[i].Proxy = strings.ReplaceAll(modelConfig.Pool.Backends[i].Proxy, macroSlug, macroStr)
+					b := &modelConfig.Pool.Backends[i]
+					b.Proxy = strings.ReplaceAll(b.Proxy, macroSlug, macroStr)
+					b.Cmd = strings.ReplaceAll(b.Cmd, macroSlug, macroStr)
+					b.CmdStop = strings.ReplaceAll(b.CmdStop, macroSlug, macroStr)
+					b.CheckEndpoint = strings.ReplaceAll(b.CheckEndpoint, macroSlug, macroStr)
+					for j := range b.Env {
+						b.Env[j] = strings.ReplaceAll(b.Env[j], macroSlug, macroStr)
+					}
 				}
 			}
 		}
 
-		// Handle PORT macro - only allocate if cmd uses it (pool-only models skip this)
+		// Handle PORT macro for local models and spawnable pool backends.
 		cmdHasPort := strings.Contains(modelConfig.Cmd, "${PORT}")
 		proxyHasPort := strings.Contains(modelConfig.Proxy, "${PORT}")
 		if !modelConfig.UsesPool() && (cmdHasPort || proxyHasPort) {
@@ -425,6 +435,42 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			nextPort++
 		}
 
+		// Pool models do not use model-level proxy/cmd; clear the default
+		// http://localhost:${PORT} so unknown-macro validation does not fail.
+		if modelConfig.UsesPool() {
+			modelConfig.Proxy = ""
+			if err := validatePoolConfig(modelId, modelConfig.Pool, modelConfig.Cmd); err != nil {
+				return Config{}, err
+			}
+			// Allocate a unique ${PORT} per spawnable backend that needs one.
+			for i := range modelConfig.Pool.Backends {
+				b := &modelConfig.Pool.Backends[i]
+				if !b.IsSpawn() {
+					continue
+				}
+				cmdHas := strings.Contains(b.Cmd, "${PORT}")
+				proxyHas := strings.Contains(b.Proxy, "${PORT}")
+				if !cmdHas && !proxyHas {
+					continue
+				}
+				if !cmdHas && proxyHas {
+					return Config{}, fmt.Errorf("model %s: pool.backends[%d].proxy uses ${PORT} but cmd does not", modelId, i)
+				}
+				portStr := fmt.Sprintf("%v", nextPort)
+				b.Cmd = strings.ReplaceAll(b.Cmd, "${PORT}", portStr)
+				b.CmdStop = strings.ReplaceAll(b.CmdStop, "${PORT}", portStr)
+				b.Proxy = strings.ReplaceAll(b.Proxy, "${PORT}", portStr)
+				b.CheckEndpoint = strings.ReplaceAll(b.CheckEndpoint, "${PORT}", portStr)
+				for j := range b.Env {
+					b.Env[j] = strings.ReplaceAll(b.Env[j], "${PORT}", portStr)
+				}
+				nextPort++
+			}
+			if err := finalizePoolBackendURLs(modelId, modelConfig.Pool); err != nil {
+				return Config{}, err
+			}
+		}
+
 		// Validate no unknown macros remain
 		fieldMap := map[string]string{
 			"cmd":                 modelConfig.Cmd,
@@ -450,6 +496,40 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			}
 		}
 
+		if modelConfig.Pool != nil {
+			for i, b := range modelConfig.Pool.Backends {
+				backendFields := map[string]string{
+					"proxy":         b.Proxy,
+					"cmd":           b.Cmd,
+					"cmdStop":       b.CmdStop,
+					"checkEndpoint": b.CheckEndpoint,
+				}
+				for fieldName, fieldValue := range backendFields {
+					matches := macroPatternRegex.FindAllStringSubmatch(fieldValue, -1)
+					for _, match := range matches {
+						macroName := match[1]
+						if macroName == "PID" && fieldName == "cmdStop" {
+							continue
+						}
+						if macroName == "PORT" || macroName == "MODEL_ID" {
+							return Config{}, fmt.Errorf("macro '${%s}' should have been substituted in %s.pool.backends[%d].%s", macroName, modelId, i, fieldName)
+						}
+						return Config{}, fmt.Errorf("unknown macro '${%s}' found in %s.pool.backends[%d].%s", macroName, modelId, i, fieldName)
+					}
+				}
+				for j, env := range b.Env {
+					matches := macroPatternRegex.FindAllStringSubmatch(env, -1)
+					for _, match := range matches {
+						macroName := match[1]
+						if macroName == "PORT" || macroName == "MODEL_ID" {
+							return Config{}, fmt.Errorf("macro '${%s}' should have been substituted in %s.pool.backends[%d].env[%d]", macroName, modelId, i, j)
+						}
+						return Config{}, fmt.Errorf("unknown macro '${%s}' found in %s.pool.backends[%d].env[%d]", macroName, modelId, i, j)
+					}
+				}
+			}
+		}
+
 		if len(modelConfig.Metadata) > 0 {
 			if err := validateNestedForUnknownMacros(modelConfig.Metadata, fmt.Sprintf("model %s metadata", modelId)); err != nil {
 				return Config{}, err
@@ -458,10 +538,6 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 
 		if err = modelConfig.Capabilities.Validate(); err != nil {
 			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
-		}
-
-		if err := validatePoolConfig(modelId, modelConfig.Pool); err != nil {
-			return Config{}, err
 		}
 
 		// Validate SetParamsByID keys and values
@@ -653,6 +729,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 
 	config.Admin.Password = strings.TrimSpace(config.Admin.Password)
 	if err := validateAdminConfig(config.Admin); err != nil {
+		return Config{}, err
+	}
+	if err := validateHTTPConfig(&config.HTTP); err != nil {
 		return Config{}, err
 	}
 

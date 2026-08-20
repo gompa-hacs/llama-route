@@ -185,22 +185,16 @@ func (sr *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
 }
 
-// clientIP resolves the originating client address, preferring proxy headers
-// over the raw connection address.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if first, _, found := strings.Cut(xff, ","); found {
-			return strings.TrimSpace(first)
-		}
-		return strings.TrimSpace(xff)
+// clientIP resolves the originating client address. Forwarded headers are only
+// honored when the immediate peer is a trusted reverse proxy.
+func clientIP(r *http.Request, httpCfg *config.HTTPConfig) string {
+	var trusts func(net.IP) bool
+	if httpCfg != nil {
+		trusts = httpCfg.Trusts
+	} else {
+		trusts = (&config.HTTPConfig{}).Trusts
 	}
-	if xr := r.Header.Get("X-Real-IP"); xr != "" {
-		return strings.TrimSpace(xr)
-	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
+	return shared.ClientIP(r, trusts)
 }
 
 // CreateRequestLogMiddleware returns middleware that records one access-log
@@ -210,7 +204,7 @@ func clientIP(r *http.Request) string {
 //
 // Frequently-polled health/metrics paths are skipped. The path is captured
 // before next runs because /upstream rewrites the request URL in place.
-func CreateRequestLogMiddleware(proxylog *logmon.Monitor) chain.Middleware {
+func CreateRequestLogMiddleware(proxylog *logmon.Monitor, httpCfg *config.HTTPConfig) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			for _, prefix := range requestLogPathSkips {
@@ -221,7 +215,7 @@ func CreateRequestLogMiddleware(proxylog *logmon.Monitor) chain.Middleware {
 			}
 
 			start := time.Now()
-			ip, method, path, proto, ua := clientIP(r), r.Method, r.URL.Path, r.Proto, r.UserAgent()
+			ip, method, path, proto, ua := clientIP(r, httpCfg), r.Method, r.URL.Path, r.Proto, r.UserAgent()
 
 			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(rec, r)

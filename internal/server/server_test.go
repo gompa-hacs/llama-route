@@ -63,7 +63,7 @@ func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	proxylog := logmon.NewWriter(io.Discard)
 	authMgr, _ := auth.NewManager(config.Config{})
-	pool, _ := router.NewPool(config.Config{}, proxylog)
+	pool, _ := router.NewPool(config.Config{}, proxylog, proxylog)
 	s := &Server{
 		cfg:         config.Config{},
 		muxlog:      logmon.NewWriter(io.Discard),
