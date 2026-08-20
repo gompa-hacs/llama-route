@@ -20,10 +20,13 @@ func TestReconcile_UniqueBareAndFQ(t *testing.T) {
 		t.Fatal("missing bare qwen")
 	}
 	if _, ok := plan.PeerRoutes["A/qwen"]; !ok {
-		t.Fatal("missing FQ")
+		t.Fatal("missing FQ route")
 	}
 	if len(plan.Pools) != 0 {
 		t.Fatalf("pools=%d", len(plan.Pools))
+	}
+	if len(plan.Listings) != 1 || plan.Listings[0].ID != "qwen" {
+		t.Fatalf("listings=%v want only bare qwen", plan.Listings)
 	}
 }
 
@@ -49,6 +52,9 @@ func TestReconcile_SameContextAutoPool(t *testing.T) {
 		if _, ok := plan.PoolAliases[key]; !ok {
 			t.Fatalf("missing pool alias %s", key)
 		}
+	}
+	if len(plan.Listings) != 1 || plan.Listings[0].ID != "qwen" {
+		t.Fatalf("listings=%v want only bare qwen", plan.Listings)
 	}
 }
 
@@ -128,8 +134,8 @@ models:
 
 func TestReconcile_AllowlistViaOffersOnly(t *testing.T) {
 	plan := Reconcile([]Offer{offer("A", "keep", 0)}, config.Config{})
-	if len(plan.Listings) != 2 { // bare + FQ
-		t.Fatalf("listings=%d", len(plan.Listings))
+	if len(plan.Listings) != 1 || plan.Listings[0].ID != "keep" {
+		t.Fatalf("listings=%v want only bare keep", plan.Listings)
 	}
 }
 

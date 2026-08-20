@@ -93,8 +93,8 @@ func TestDiscovery_E2E_AutoPoolAndRoute(t *testing.T) {
 	if peer.Handles("qwen") {
 		t.Fatal("pooled model should not also be a peer route")
 	}
-	if len(mgr.Listings()) < 3 {
-		t.Fatalf("listings=%d want >=3", len(mgr.Listings()))
+	if len(mgr.Listings()) != 1 || mgr.Listings()[0].ID != "qwen" {
+		t.Fatalf("listings=%v want only bare qwen", mgr.Listings())
 	}
 
 	body := strings.NewReader(`{"model":"qwen","messages":[]}`)

@@ -61,19 +61,29 @@ func Reconcile(offers []Offer, cfg config.Config) RoutePlan {
 				for _, key := range pool.RouteKeys {
 					plan.PoolAliases[key] = idx
 				}
-				for _, key := range pool.RouteKeys {
-					peerID := ""
-					if key != modelID {
-						peerID = fqPeerID(key, modelID)
-					}
+				// List bare when unambiguous; otherwise list FQ keys only.
+				// FQ route keys stay registered for addressing but are not duplicated
+				// in /v1/models when a bare name is already listed.
+				if allowBare {
 					plan.Listings = append(plan.Listings, Listing{
-						ID:              key,
-						PeerID:          peerID,
+						ID:              modelID,
+						PeerID:          "",
 						UpstreamModelID: modelID,
 						ContextSize:     cs,
 						Pooled:          true,
 						Discovered:      true,
 					})
+				} else {
+					for _, key := range pool.RouteKeys {
+						plan.Listings = append(plan.Listings, Listing{
+							ID:              key,
+							PeerID:          fqPeerID(key, modelID),
+							UpstreamModelID: modelID,
+							ContextSize:     cs,
+							Pooled:          true,
+							Discovered:      true,
+						})
+					}
 				}
 				continue
 			}
@@ -90,18 +100,19 @@ func Reconcile(offers []Offer, cfg config.Config) RoutePlan {
 				ContextSize:     o.ContextSize,
 			}
 			plan.PeerRoutes[fq] = route
-			plan.Listings = append(plan.Listings, Listing{
-				ID:              fq,
-				PeerID:          o.PeerID,
-				UpstreamModelID: o.ModelID,
-				ContextSize:     o.ContextSize,
-				Pooled:          false,
-				Discovered:      true,
-			})
 			if allowBare {
 				plan.PeerRoutes[modelID] = route
 				plan.Listings = append(plan.Listings, Listing{
 					ID:              modelID,
+					PeerID:          o.PeerID,
+					UpstreamModelID: o.ModelID,
+					ContextSize:     o.ContextSize,
+					Pooled:          false,
+					Discovered:      true,
+				})
+			} else {
+				plan.Listings = append(plan.Listings, Listing{
+					ID:              fq,
 					PeerID:          o.PeerID,
 					UpstreamModelID: o.ModelID,
 					ContextSize:     o.ContextSize,

@@ -624,8 +624,9 @@ routing:
 # - discovery rules:
 #   - same model ID + same context_length on ≥2 peers → sticky auto-pool under the bare ID
 #   - same model ID + different context sizes → only peerID/modelID (no bare name)
-#   - unique model → bare ID plus peerID/modelID
+#   - unique model → bare ID in /v1/models (peerID/modelID still routable, not listed)
 #   - local models: entries always win the bare name; FQ peer names still work
+#   - /v1/models lists one entry per logical model (no bare+FQ duplicates)
 # - peers without a working /v1/models contribute nothing until the endpoint responds
 peers:
   # keys is the peer ID (used in peerID/modelID namespaces)
