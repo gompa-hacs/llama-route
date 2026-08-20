@@ -222,6 +222,14 @@ func lspciDeviceName(pciSlot string) string {
 	// Example: 06:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Rembrandt [Radeon 680M] [1002:1681] (rev 0b)
 	if idx := strings.Index(line, ": "); idx >= 0 && idx+2 < len(line) {
 		name := line[idx+2:]
+		// Prefer the marketing name inside brackets when present, e.g.
+		// "... Ellesmere [Radeon RX 470/480/570/570X/580/580X/590] [1002:67df]"
+		if start := strings.Index(name, "[Radeon "); start >= 0 {
+			rest := name[start+1:] // drop leading '['
+			if end := strings.Index(rest, "]"); end > 0 {
+				return strings.TrimSpace(rest[:end])
+			}
+		}
 		if end := strings.LastIndex(name, " ["); end > 0 {
 			name = name[:end]
 		}

@@ -36,6 +36,43 @@
     return COLORS[((hash % COLORS.length) + COLORS.length) % COLORS.length];
   }
 
+  /** Latest sample per GPU (peers return the full history ring). */
+  function latestGpus(stats: GpuStat[]): GpuStat[] {
+    const byKey = new Map<string, GpuStat>();
+    for (const g of stats) {
+      const key = g.uuid || `id:${g.id}`;
+      const prev = byKey.get(key);
+      if (!prev || new Date(g.timestamp).getTime() >= new Date(prev.timestamp).getTime()) {
+        byKey.set(key, g);
+      }
+    }
+    return [...byKey.values()].sort((a, b) => {
+      if (a.id !== b.id) return a.id - b.id;
+      return (a.uuid || "").localeCompare(b.uuid || "");
+    });
+  }
+
+  /** Short label; identical AMD product names are disambiguated by PCI slot. */
+  function shortGpuName(g: GpuStat): string {
+    let name = g.name?.trim() || `GPU ${g.id}`;
+    const radeon = name.match(/\[(Radeon [^\]]+)\]/i);
+    if (radeon) {
+      name = radeon[1];
+    } else if (name.length > 48) {
+      name = `${name.slice(0, 45)}…`;
+    }
+    if (g.uuid) {
+      name = `${name} (${g.uuid.replace(/^0000:/, "")})`;
+    }
+    return name;
+  }
+
+  function avgCpuPct(cores: number[] | undefined): string {
+    if (!cores?.length) return "?";
+    const sum = cores.reduce((a, b) => a + b, 0);
+    return (sum / cores.length).toFixed(1);
+  }
+
   const WINDOWS = [
     { label: "5 min", ms: 5 * 60 * 1000 },
     { label: "15 min", ms: 15 * 60 * 1000 },
@@ -52,6 +89,7 @@
 
   let selectedWindow = persistentStore("perf-window", 0);
   let selectedInterval = persistentStore("perf-refresh-interval", 0);
+  let collapsedPeers = persistentStore<Record<string, boolean>>("perf-collapsed-peers", {});
   let sysData = $state<SysStat[]>([]);
   let gpuData = $state<GpuStat[]>([]);
   let refreshing = $state(false);
@@ -60,6 +98,22 @@
   let peerPollTime = $state<string>("");
 
   let poolData = $state<PoolMetricsSnapshot | null>(null);
+
+  function isPeerCollapsed(name: string): boolean {
+    return !!$collapsedPeers[name];
+  }
+
+  function togglePeerCollapsed(name: string) {
+    collapsedPeers.update((map) => {
+      const next = { ...map };
+      if (next[name]) {
+        delete next[name];
+      } else {
+        next[name] = true;
+      }
+      return next;
+    });
+  }
 
   async function loadPeerData() {
     const resp = await fetchPeerMetrics();
@@ -99,8 +153,7 @@
   const sysLabels = $derived.by(() => {
     const stats = filteredSysStats;
     if (stats.length === 0) return [];
-    const refTime = new Date(stats[stats.length - 1].timestamp).getTime();
-    return stats.map((s) => formatDelta(s.timestamp, refTime));
+    return timeLabels(stats.map((s) => s.timestamp));
   });
 
   async function loadAll() {
@@ -109,7 +162,7 @@
       sysData = resp.sys_stats ?? [];
       gpuData = resp.gpu_stats ?? [];
     }
-    await loadPoolData();
+    await Promise.all([loadPoolData(), loadPeerData()]);
   }
 
   async function loadIncremental() {
@@ -125,7 +178,7 @@
         gpuData = [...gpuData, ...newGpu];
       }
     }
-    await loadPoolData();
+    await Promise.all([loadPoolData(), loadPeerData()]);
   }
 
   function startPolling() {
@@ -178,7 +231,6 @@
     mounted = true;
     document.addEventListener("visibilitychange", handleVisibility);
     loadAll().then(() => startPolling());
-    loadPeerData();
 
     const unsubPool = poolMetrics.subscribe((snap) => {
       if (snap) poolData = snap;
@@ -192,32 +244,32 @@
     };
   });
 
-  // --- System charts (filtered by time window) ---
+  function timeLabels(timestamps: string[]): string[] {
+    if (timestamps.length === 0) return [];
+    const refTime = new Date(timestamps[timestamps.length - 1]).getTime();
+    return timestamps.map((ts) => formatDelta(ts, refTime));
+  }
 
-  const filteredSysStats = $derived(sysData.filter((s) => new Date(s.timestamp).getTime() >= cutoffTime()));
-
-  const cpuDatasets = $derived.by(() => {
-    const stats = filteredSysStats;
+  function buildCpuDatasetsFrom(stats: SysStat[]) {
     if (stats.length === 0) return [];
     const coreCount = stats[0].cpu_util_per_core.length;
     const datasets = [];
     for (let i = 0; i < coreCount; i++) {
       datasets.push({
         label: `Core ${i}`,
-        data: stats.map((s) => s.cpu_util_per_core[i]),
+        data: stats.map((s) => s.cpu_util_per_core[i] ?? 0),
         borderColor: stableColor(i),
       });
     }
     return datasets;
-  });
+  }
 
-  const memSwapDatasets = $derived.by(() => {
-    const stats = filteredSysStats;
+  function buildMemSwapDatasetsFrom(stats: SysStat[]) {
     if (stats.length === 0) return [];
     return [
       {
         label: "Memory Used %",
-        data: stats.map((s) => (s.mem_used_mb / s.mem_total_mb) * 100),
+        data: stats.map((s) => (s.mem_total_mb > 0 ? (s.mem_used_mb / s.mem_total_mb) * 100 : 0)),
         borderColor: stableColor("mem-used"),
       },
       {
@@ -226,7 +278,23 @@
         borderColor: stableColor("swap-used"),
       },
     ];
-  });
+  }
+
+  function buildLoadDatasetsFrom(stats: SysStat[]) {
+    if (stats.length === 0) return [];
+    return [
+      { label: "1 min", data: stats.map((s) => s.load_avg_1), borderColor: stableColor("load-1") },
+      { label: "5 min", data: stats.map((s) => s.load_avg_5), borderColor: stableColor("load-5") },
+      { label: "15 min", data: stats.map((s) => s.load_avg_15), borderColor: stableColor("load-15") },
+    ];
+  }
+
+  // --- System charts (filtered by time window) ---
+
+  const filteredSysStats = $derived(sysData.filter((s) => new Date(s.timestamp).getTime() >= cutoffTime()));
+
+  const cpuDatasets = $derived(buildCpuDatasetsFrom(filteredSysStats));
+  const memSwapDatasets = $derived(buildMemSwapDatasetsFrom(filteredSysStats));
 
   const latestMemSwap = $derived.by(() => {
     const stats = filteredSysStats;
@@ -242,27 +310,7 @@
     };
   });
 
-  const loadDatasets = $derived.by(() => {
-    const stats = filteredSysStats;
-    if (stats.length === 0) return [];
-    return [
-      {
-        label: "1 min",
-        data: stats.map((s) => s.load_avg_1),
-        borderColor: stableColor("load-1"),
-      },
-      {
-        label: "5 min",
-        data: stats.map((s) => s.load_avg_5),
-        borderColor: stableColor("load-5"),
-      },
-      {
-        label: "15 min",
-        data: stats.map((s) => s.load_avg_15),
-        borderColor: stableColor("load-15"),
-      },
-    ];
-  });
+  const loadDatasets = $derived(buildLoadDatasetsFrom(filteredSysStats));
 
   const netBandwidthDatasets = $derived.by(() => {
     const stats = filteredSysStats;
@@ -361,26 +409,26 @@
   ) {
     if (stats.length === 0) return [];
 
-    const byId = new Map<number, { name: string; values: number[] }>();
+    const byKey = new Map<string, { id: number; name: string; values: number[] }>();
     for (const g of stats) {
-      if (!byId.has(g.id)) {
-        byId.set(g.id, { name: g.name, values: [] });
+      const key = g.uuid || `id:${g.id}`;
+      if (!byKey.has(key)) {
+        byKey.set(key, { id: g.id, name: shortGpuName(g), values: [] });
       }
-      byId.get(g.id)!.values.push(g[field] as number);
+      byKey.get(key)!.values.push(g[field] as number);
     }
 
-    // Sort by id and key color off id so series keep the same color across refreshes
-    // even when sample arrival order or which GPUs appear in the window changes.
-    const datasets = [];
-    for (const id of [...byId.keys()].sort((a, b) => a - b)) {
-      const entry = byId.get(id)!;
-      datasets.push({
-        label: entry.name || `GPU ${id}`,
-        data: entry.values,
-        borderColor: stableColor(id),
-      });
-    }
-    return datasets;
+    // Sort by id (then key) and color by stable key so series stay consistent
+    // across refreshes even when sample arrival order changes.
+    const entries = [...byKey.entries()].sort(([ka, a], [kb, b]) => {
+      if (a.id !== b.id) return a.id - b.id;
+      return ka.localeCompare(kb);
+    });
+    return entries.map(([key, entry]) => ({
+      label: entry.name || `GPU ${entry.id}`,
+      data: entry.values,
+      borderColor: stableColor(key),
+    }));
   }
 
   const gpuUtilDatasets = $derived(buildGpuDatasets(filteredGpuStats, "gpu_util_pct"));
@@ -393,6 +441,46 @@
   const hasVramTemp = $derived(filteredGpuStats.some((g) => g.vram_temp_c > 0));
   const hasGpuClock = $derived(filteredGpuStats.some((g) => g.clock_mhz > 0));
   const hasMemClock = $derived(filteredGpuStats.some((g) => g.mem_clock_mhz > 0));
+
+  const peerCharts = $derived.by(() => {
+    const cutoff = cutoffTime();
+    return Object.values(peerData).map((peer) => {
+      const sys = (peer.sys_stats ?? []).filter((s) => new Date(s.timestamp).getTime() >= cutoff);
+      const gpu = (peer.gpu_stats ?? []).filter((g) => new Date(g.timestamp).getTime() >= cutoff);
+      const latestSys = sys.length > 0 ? sys[sys.length - 1] : null;
+      const sysLabelList = timeLabels(sys.map((s) => s.timestamp));
+      const gpuLabelSeen = new Set<string>();
+      const gpuLabelList: string[] = [];
+      if (gpu.length > 0) {
+        const refTime = new Date(gpu[gpu.length - 1].timestamp).getTime();
+        for (const g of gpu) {
+          const label = formatDelta(g.timestamp, refTime);
+          if (!gpuLabelSeen.has(label)) {
+            gpuLabelSeen.add(label);
+            gpuLabelList.push(label);
+          }
+        }
+      }
+      return {
+        peer,
+        latestSys,
+        latestGpu: latestGpus(peer.gpu_stats ?? []),
+        sysLabels: sysLabelList,
+        gpuLabels: gpuLabelList,
+        cpuDatasets: buildCpuDatasetsFrom(sys),
+        memDatasets: buildMemSwapDatasetsFrom(sys),
+        loadDatasets: buildLoadDatasetsFrom(sys),
+        gpuUtil: buildGpuDatasets(gpu, "gpu_util_pct"),
+        gpuMem: buildGpuDatasets(gpu, "mem_util_pct"),
+        gpuTemp: buildGpuDatasets(gpu, "temp_c"),
+        gpuPower: buildGpuDatasets(gpu, "power_draw_w"),
+        gpuClock: buildGpuDatasets(gpu, "clock_mhz"),
+        hasSys: sys.length > 0,
+        hasGpu: gpu.length > 0,
+        hasClock: gpu.some((g) => g.clock_mhz > 0),
+      };
+    });
+  });
 </script>
 
 <div class="space-y-6">
@@ -609,45 +697,161 @@
   {/if}
 
   <!-- Peer Performance Section -->
-  {#if Object.keys(peerData).length > 0}
-    <section class="space-y-4">
-      <h3 class="text-lg font-medium text-txtmain">Peers</h3>
-      <p class="text-sm text-txtsecondary">
-        Metrics aggregated from upstream llama-swap sidecars. Last poll: {peerPollTime ? new Date(peerPollTime).toLocaleTimeString() : "never"}.
-      </p>
-      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {#each Object.entries(peerData) as [, peer]}
-          <div class="card p-4 space-y-3">
-            <div class="flex items-center justify-between">
-              <span class="font-medium text-txtmain">{peer.peer_name}</span>
-              <span class="text-xs px-2 py-0.5 rounded-full" class:bg-green-900={peer.success} class:text-green-300={peer.success} class:bg-red-900={!peer.success} class:text-red-300={!peer.success}>
-                {peer.success ? "connected" : "error"}
+  {#if peerCharts.length > 0}
+    <section class="space-y-6">
+      <div>
+        <h3 class="text-lg font-medium text-txtmain">Peers</h3>
+        <p class="text-sm text-txtsecondary">
+          Live performance from upstream llama-swap sidecars. Last poll: {peerPollTime
+            ? new Date(peerPollTime).toLocaleTimeString()
+            : "never"}.
+        </p>
+      </div>
+      {#each peerCharts as view}
+        {@const collapsed = isPeerCollapsed(view.peer.peer_name)}
+        <div class="card p-4 space-y-4">
+          <button
+            type="button"
+            class="w-full flex items-center gap-2 text-left"
+            onclick={() => togglePeerCollapsed(view.peer.peer_name)}
+            aria-expanded={!collapsed}
+          >
+            <svg
+              class="w-4 h-4 shrink-0 text-txtsecondary transition-transform {collapsed ? '-rotate-90' : ''}"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+            >
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+            </svg>
+            <h4 class="font-medium text-txtmain flex-1 truncate">{view.peer.peer_name}</h4>
+            {#if collapsed && view.latestSys}
+              <span class="hidden sm:inline text-xs text-txtsecondary truncate mr-2">
+                CPU {avgCpuPct(view.latestSys.cpu_util_per_core)}% · RAM {((view.latestSys.mem_used_mb /
+                  view.latestSys.mem_total_mb) *
+                  100).toFixed(0)}% · {view.latestGpu.length} GPU{view.latestGpu.length === 1 ? "" : "s"}
               </span>
-            </div>
-            {#if peer.error}
-              <p class="text-xs text-red-400">{peer.error}</p>
             {/if}
-            {#if peer.sys_stats?.length > 0}
-              {@const latest = peer.sys_stats[peer.sys_stats.length - 1]}
-              <div class="text-xs text-txtsecondary space-y-1">
-                <p>CPU: {latest.cpu_util_per_core[0]?.toFixed(1) ?? "?"}%</p>
-                <p>RAM: {((latest.mem_used_mb / latest.mem_total_mb) * 100).toFixed(1)}% ({latest.mem_used_mb} / {latest.mem_total_mb} MB)</p>
-                <p>Load: {latest.load_avg_1.toFixed(2)} / {latest.load_avg_5.toFixed(2)} / {latest.load_avg_15.toFixed(2)}</p>
+            <span
+              class="text-xs px-2 py-0.5 rounded-full shrink-0"
+              class:bg-green-900={view.peer.success}
+              class:text-green-300={view.peer.success}
+              class:bg-red-900={!view.peer.success}
+              class:text-red-300={!view.peer.success}
+            >
+              {view.peer.success ? "connected" : "error"}
+            </span>
+          </button>
+
+          {#if !collapsed}
+            {#if view.peer.error}
+              <p class="text-xs text-red-400">{view.peer.error}</p>
+            {/if}
+            {#if view.latestSys}
+              <div class="flex flex-wrap gap-4 text-xs text-txtsecondary">
+                <span>CPU: <span class="text-txtmain font-medium">{avgCpuPct(view.latestSys.cpu_util_per_core)}%</span></span>
+                <span
+                  >RAM:
+                  <span class="text-txtmain font-medium"
+                    >{((view.latestSys.mem_used_mb / view.latestSys.mem_total_mb) * 100).toFixed(1)}% ({view.latestSys
+                      .mem_used_mb} / {view.latestSys.mem_total_mb} MB)</span
+                  ></span
+                >
+                <span
+                  >Load:
+                  <span class="text-txtmain font-medium"
+                    >{view.latestSys.load_avg_1.toFixed(2)} / {view.latestSys.load_avg_5.toFixed(2)} / {view.latestSys.load_avg_15.toFixed(
+                      2,
+                    )}</span
+                  ></span
+                >
               </div>
             {/if}
-            {#if peer.gpu_stats?.length > 0}
+            {#if view.latestGpu.length > 0}
               <div class="text-xs text-txtsecondary space-y-1">
-                {#each peer.gpu_stats as gpu}
-                  <p>{gpu.name}: {gpu.gpu_util_pct.toFixed(1)}% util, {gpu.temp_c}°C, {((gpu.mem_used_mb / gpu.mem_total_mb) * 100).toFixed(1)}% VRAM{#if gpu.clock_mhz > 0}, {gpu.clock_mhz} MHz{/if}</p>
+                {#each view.latestGpu as gpu}
+                  <p
+                    >{shortGpuName(gpu)}: {gpu.gpu_util_pct.toFixed(1)}% util, {gpu.temp_c}°C, {(gpu.mem_total_mb > 0
+                      ? (gpu.mem_used_mb / gpu.mem_total_mb) * 100
+                      : 0
+                    ).toFixed(1)}% VRAM{#if gpu.clock_mhz > 0}, {gpu.clock_mhz} MHz{/if}</p
+                  >
                 {/each}
               </div>
             {/if}
-            {#if peer.metrics}
-              <p class="text-xs text-txtsecondary">{peer.metrics.length} requests recorded</p>
+
+            {#if view.hasGpu}
+              <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <PerformanceChart
+                  title="GPU Utilization (%)"
+                  labels={view.gpuLabels}
+                  datasets={view.gpuUtil}
+                  yMin={0}
+                  yMax={100}
+                  yLabel="%"
+                />
+                <PerformanceChart
+                  title="GPU Memory Utilization (%)"
+                  labels={view.gpuLabels}
+                  datasets={view.gpuMem}
+                  yMin={0}
+                  yMax={100}
+                  yLabel="%"
+                />
+                <PerformanceChart
+                  title="GPU Temperature (°C)"
+                  labels={view.gpuLabels}
+                  datasets={view.gpuTemp}
+                  yMin={0}
+                  yLabel="°C"
+                />
+                <PerformanceChart
+                  title="GPU Power Draw (W)"
+                  labels={view.gpuLabels}
+                  datasets={view.gpuPower}
+                  yMin={0}
+                  yLabel="W"
+                />
+                {#if view.hasClock}
+                  <PerformanceChart
+                    title="GPU Clock (MHz)"
+                    labels={view.gpuLabels}
+                    datasets={view.gpuClock}
+                    yMin={0}
+                    yLabel="MHz"
+                  />
+                {/if}
+              </div>
+            {:else if view.peer.success}
+              <p class="text-xs text-txtsecondary">No GPU history from this peer yet.</p>
             {/if}
-          </div>
-        {/each}
-      </div>
+
+            {#if view.hasSys}
+              <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <PerformanceChart
+                  title="CPU Utilization (%)"
+                  labels={view.sysLabels}
+                  datasets={view.cpuDatasets}
+                  yMin={0}
+                  yMax={100}
+                  yLabel="%"
+                  showLegend={false}
+                />
+                <PerformanceChart
+                  title="Memory & Swap Usage (%)"
+                  labels={view.sysLabels}
+                  datasets={view.memDatasets}
+                  yMin={0}
+                  yMax={100}
+                  yLabel="%"
+                />
+                <PerformanceChart title="Load Average" labels={view.sysLabels} datasets={view.loadDatasets} yMin={0} />
+              </div>
+            {/if}
+          {/if}
+        </div>
+      {/each}
     </section>
   {/if}
 </div>
