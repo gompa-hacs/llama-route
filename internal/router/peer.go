@@ -1,33 +1,46 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/discovery"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/tidwall/sjson"
 )
 
 type peerMember struct {
 	peerID       string
 	reverseProxy *httputil.ReverseProxy
-	apiKey       string
+}
+
+type peerRoute struct {
+	peerID          string
+	upstreamModelID string
+	apiKey          string
 }
 
 type Peer struct {
-	cfg    config.Config
-	logger *logmon.Monitor
-	peers  map[string]*peerMember
+	cfg     config.Config
+	logger  *logmon.Monitor
+	members map[string]*peerMember // peerID -> transport
+
+	routesMu sync.RWMutex
+	routes   map[string]peerRoute // bare or FQ model key -> route
 
 	shutdownCtx  context.Context
 	shutdownFn   context.CancelFunc
@@ -37,7 +50,7 @@ type Peer struct {
 
 func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 	peers := cfg.Peers
-	modelMap := make(map[string]*peerMember)
+	members := make(map[string]*peerMember)
 
 	peerIDs := make([]string, 0, len(peers))
 	for peerID := range peers {
@@ -78,8 +91,9 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 			return nil
 		}
 
+		capturedID := peerID
 		reverseProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			logger.Warnf("peer %s: proxy error: %v", peerID, err)
+			logger.Warnf("peer %s: proxy error: %v", capturedID, err)
 			errMsg := fmt.Sprintf("peer proxy error: %v", err)
 			if runtime.GOOS == "darwin" && strings.Contains(err.Error(), "connect: no route to host") {
 				errMsg += " (hint: on macOS, check System Settings > Privacy & Security > Local Network permissions)"
@@ -87,18 +101,9 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 			http.Error(w, errMsg, http.StatusBadGateway)
 		}
 
-		pp := &peerMember{
+		members[peerID] = &peerMember{
 			peerID:       peerID,
 			reverseProxy: reverseProxy,
-			apiKey:       peer.ApiKey,
-		}
-
-		for _, modelID := range peer.Models {
-			if _, found := modelMap[modelID]; found {
-				logger.Warnf("peer %s: model %s already mapped to another peer, skipping", peerID, modelID)
-				continue
-			}
-			modelMap[modelID] = pp
 		}
 	}
 
@@ -107,15 +112,38 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 	return &Peer{
 		cfg:         cfg,
 		logger:      logger,
-		peers:       modelMap,
+		members:     members,
+		routes:      make(map[string]peerRoute),
 		shutdownCtx: shutdownCtx,
 		shutdownFn:  shutdownFn,
 	}, nil
 }
 
 func (r *Peer) Handles(model string) bool {
-	_, ok := r.peers[model]
+	r.routesMu.RLock()
+	defer r.routesMu.RUnlock()
+	_, ok := r.routes[model]
 	return ok
+}
+
+// ReplaceDiscovered installs discovery-owned peer routes (bare + FQ keys).
+func (r *Peer) ReplaceDiscovered(routes map[string]discovery.PeerRoute) error {
+	next := make(map[string]peerRoute, len(routes))
+	for key, spec := range routes {
+		if _, ok := r.members[spec.PeerID]; !ok {
+			r.logger.Warnf("discovery peer route %q: unknown peer %s, skipping", key, spec.PeerID)
+			continue
+		}
+		next[key] = peerRoute{
+			peerID:          spec.PeerID,
+			upstreamModelID: spec.UpstreamModelID,
+			apiKey:          spec.ApiKey,
+		}
+	}
+	r.routesMu.Lock()
+	r.routes = next
+	r.routesMu.Unlock()
+	return nil
 }
 
 func (r *Peer) Shutdown(timeout time.Duration) error {
@@ -159,30 +187,64 @@ func (r *Peer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	pp, found := r.peers[data.ModelID]
+	r.routesMu.RLock()
+	route, found := r.routes[data.ModelID]
+	r.routesMu.RUnlock()
 	if !found {
 		r.logger.Warnf("peer model not found: %s", data.ModelID)
 		shared.SendError(w, req, ErrNoPeerModelFound)
 		return
 	}
 
-	r.logger.Debugf("peer: routing model %s to peer %s", data.ModelID, pp.peerID)
-
-	if pp.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+pp.apiKey)
-		req.Header.Set("x-api-key", pp.apiKey)
+	member, ok := r.members[route.peerID]
+	if !ok {
+		shared.SendError(w, req, ErrNoPeerModelFound)
+		return
 	}
 
-	// Cancel the proxy request when the client disconnects or shutdown times out.
-	// AfterFunc links both parent contexts to our child without a goroutine leak.
+	r.logger.Debugf("peer: routing model %s to peer %s (upstream=%s)", data.ModelID, route.peerID, route.upstreamModelID)
+
+	if route.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+route.apiKey)
+		req.Header.Set("x-api-key", route.apiKey)
+	}
+
+	if route.upstreamModelID != "" && data.Model != route.upstreamModelID {
+		if err := rewritePeerRequestModel(req, route.upstreamModelID); err != nil {
+			shared.SendError(w, req, err)
+			return
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	stopReq := context.AfterFunc(req.Context(), cancel)
 	stopShutdown := context.AfterFunc(r.shutdownCtx, cancel)
 	req = req.WithContext(ctx)
 
-	pp.reverseProxy.ServeHTTP(w, req)
+	member.reverseProxy.ServeHTTP(w, req)
 
 	stopShutdown()
 	stopReq()
 	cancel()
+}
+
+func rewritePeerRequestModel(req *http.Request, modelID string) error {
+	ct := req.Header.Get("Content-Type")
+	if !strings.Contains(ct, "application/json") || req.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return fmt.Errorf("reading body for model rewrite: %w", err)
+	}
+	_ = req.Body.Close()
+	body, err = sjson.SetBytes(body, "model", modelID)
+	if err != nil {
+		return fmt.Errorf("rewriting model: %w", err)
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	req.Header.Del("Transfer-Encoding")
+	return nil
 }

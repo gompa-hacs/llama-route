@@ -147,6 +147,10 @@ Client request for model "llama-70b"
 
 Dispatch order for any model: **pool → local (swap) → peer**.
 
+Discovered peer models are applied into the pool and peer routers automatically
+(see [configuration.md](configuration.md)). Explicit YAML `models.*.pool`
+entries are never merged with discovery.
+
 ### Affinity keys (sticky sessions)
 
 There is **no automatic session ID** in the OpenAI Chat Completions API. For
@@ -189,9 +193,9 @@ least-inflight (no stickiness). This is correct for anonymous one-shot calls.
 
 | | `pool` | `peers` |
 | - | ------ | ------- |
-| Same model on multiple URLs | Yes | No (one peer per model name) |
-| Process management | No | No |
-| Use case | Load balance identical backends | Route different models to different hosts |
+| Same model on multiple URLs | Yes (YAML or auto-discovered) | Auto-pooled when name+context match |
+| Process management | Optional spawn backends | No |
+| Use case | Load balance identical backends | Route / discover remote model catalogs |
 
 ---
 

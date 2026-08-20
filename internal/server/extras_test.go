@@ -161,7 +161,7 @@ func TestServer_StripVersionPrefix(t *testing.T) {
 }
 
 func TestServer_CloseStreams(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 	s.CloseStreams()
 	select {
 	case <-s.shutdownCtx.Done():
@@ -172,7 +172,7 @@ func TestServer_CloseStreams(t *testing.T) {
 }
 
 func TestServer_HandleUIAndFavicon(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	for _, path := range []string{"/ui/", "/favicon.ico"} {
 		w := httptest.NewRecorder()
@@ -187,7 +187,7 @@ func TestServer_HandleUIAndFavicon(t *testing.T) {
 
 func TestServer_HandleAPIUnloadAll(t *testing.T) {
 	local := newStubRouter([]string{"m1"}, "")
-	s := newTestServer(local, newStubRouter(nil, ""))
+	s := newTestServer(local)
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/models/unload", nil))
@@ -202,7 +202,7 @@ func TestServer_HandleAPIUnloadAll(t *testing.T) {
 
 func TestServer_HandleAPIUnloadModel(t *testing.T) {
 	local := newStubRouter([]string{"m1"}, "")
-	s := newTestServer(local, newStubRouter(nil, ""))
+	s := newTestServer(local)
 	s.cfg = config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
 
 	t.Run("known model", func(t *testing.T) {
@@ -223,7 +223,7 @@ func TestServer_HandleAPIUnloadModel(t *testing.T) {
 }
 
 func TestServer_HandleAPICapture(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 	s.metrics = newMetricsMonitor(logmon.NewWriter(io.Discard), 100, 5)
 	s.metrics.addCapture(ReqRespCapture{ID: 42, ReqPath: "/v1/chat/completions"})
 

@@ -14,7 +14,6 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
-	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
@@ -242,12 +241,27 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	for peerID, peer := range s.cfg.Peers {
-		for _, modelID := range peer.Models {
-			if !allows(modelID, modelID) {
+	if s.discovery != nil {
+		for _, listing := range s.discovery.Listings() {
+			if !allows(listing.ID, listing.UpstreamModelID) {
 				continue
 			}
-			data = append(data, newRecord(modelID, peerID+": "+modelID, "", map[string]any{"peerID": peerID}, config.ModelCapConfig{}, nil))
+			name := listing.ID
+			if listing.PeerID != "" {
+				name = listing.PeerID + ": " + listing.UpstreamModelID
+			}
+			meta := map[string]any{
+				"discovered": true,
+				"pooled":     listing.Pooled,
+			}
+			if listing.PeerID != "" {
+				meta["peerID"] = listing.PeerID
+			}
+			rec := newRecord(listing.ID, name, "", meta, config.ModelCapConfig{}, nil)
+			if listing.ContextSize > 0 {
+				rec.ContextLength = listing.ContextSize
+			}
+			data = append(data, rec)
 		}
 	}
 
@@ -332,11 +346,11 @@ func (s *Server) startPreload() {
 	models := s.cfg.Hooks.OnStartup.Preload
 	go func() {
 		// Always preload pool models configured with pool.start: preload.
-		if pool, ok := s.pool.(*router.Pool); ok && pool != nil {
+		if s.pool != nil {
 			for id, mc := range s.cfg.Models {
 				if mc.UsesPool() && mc.Pool.StartMode() == "preload" {
 					s.proxylog.Infof("preloading pool model: %s", id)
-					pool.Preload(id)
+					s.pool.Preload(id)
 				}
 			}
 		}
@@ -345,9 +359,9 @@ func (s *Server) startPreload() {
 			return
 		}
 		for _, modelID := range models {
-			if pool, ok := s.pool.(*router.Pool); ok && pool != nil && pool.Handles(modelID) {
+			if s.pool != nil && s.pool.Handles(modelID) {
 				s.proxylog.Infof("preloading pool model: %s", modelID)
-				pool.Preload(modelID)
+				s.pool.Preload(modelID)
 				event.Emit(shared.ModelPreloadedEvent{ModelName: modelID, Success: true})
 				continue
 			}

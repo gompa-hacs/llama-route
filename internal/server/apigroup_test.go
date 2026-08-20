@@ -30,7 +30,7 @@ func TestServer_InflightMiddleware(t *testing.T) {
 }
 
 func TestServer_APIVersion(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 	s.build = BuildInfo{Version: "1.2.3", Commit: "deadbeef", Date: "2026-05-19"}
 
 	w := httptest.NewRecorder()
@@ -49,7 +49,7 @@ func TestServer_APIVersion(t *testing.T) {
 }
 
 func TestServer_APIMetrics_Empty(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/metrics", nil))
@@ -63,7 +63,7 @@ func TestServer_APIMetrics_Empty(t *testing.T) {
 }
 
 func TestServer_APIPoolMetrics_Empty(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/pool-metrics", nil))
@@ -86,7 +86,7 @@ func TestServer_APIPoolMetrics_Empty(t *testing.T) {
 }
 
 func TestServer_APIPerformance_Unavailable(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/performance", nil))
@@ -97,7 +97,7 @@ func TestServer_APIPerformance_Unavailable(t *testing.T) {
 }
 
 func TestServer_APIEvents_InitialPayload(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)

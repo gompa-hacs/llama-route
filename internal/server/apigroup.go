@@ -12,7 +12,6 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/perf"
-	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
@@ -61,9 +60,18 @@ func (s *Server) modelStatus() []apiModel {
 		})
 	}
 
-	for peerID, peer := range s.cfg.Peers {
-		for _, modelID := range peer.Models {
-			models = append(models, apiModel{Id: modelID, PeerID: peerID})
+	if s.discovery != nil {
+		for _, listing := range s.discovery.Listings() {
+			name := listing.UpstreamModelID
+			if listing.PeerID != "" {
+				name = listing.PeerID + ": " + listing.UpstreamModelID
+			}
+			models = append(models, apiModel{
+				Id:     listing.ID,
+				Name:   name,
+				State:  "ready",
+				PeerID: listing.PeerID,
+			})
 		}
 	}
 
@@ -168,13 +176,12 @@ func (s *Server) handleAPIPeerMetrics(w http.ResponseWriter, r *http.Request) {
 
 // handleAPIPoolMetrics serves live pool backend load/affinity state.
 func (s *Server) handleAPIPoolMetrics(w http.ResponseWriter, r *http.Request) {
-	pool, ok := s.pool.(*router.Pool)
-	if !ok || pool == nil {
+	if s.pool == nil {
 		shared.SendResponse(w, r, http.StatusServiceUnavailable, "pool metrics not available")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(pool.Stats())
+	json.NewEncoder(w).Encode(s.pool.Stats())
 }
 
 // handleAPICapture returns the stored request/response capture for a metric ID.
@@ -293,8 +300,8 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	sendModels()
 	sendMetrics(s.metrics.getMetrics())
 	sendInFlight(int(s.inflight.Current()))
-	if pool, ok := s.pool.(*router.Pool); ok && pool != nil {
-		sendPoolMetrics(pool.Stats())
+	if s.pool != nil {
+		sendPoolMetrics(s.pool.Stats())
 	}
 
 	for {

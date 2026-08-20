@@ -6,12 +6,12 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/discovery"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 	"github.com/tidwall/sjson"
 )
@@ -27,7 +27,7 @@ import (
 // Non-JSON requests (GET, multipart forms) pass through untouched. The buffered
 // body is re-attached with Content-Length / Transfer-Encoding cleanup so the
 // downstream reverse proxy forwards the correct bytes (see issue #11).
-func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
+func CreateFilterMiddleware(cfg config.Config, discovered *discovery.Manager) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !strings.Contains(r.Header.Get("Content-Type"), "application/json") {
@@ -41,7 +41,7 @@ func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
 				return
 			}
 
-			useModelName, filters, ok := resolveFilters(cfg, data.Model)
+			useModelName, filters, ok := resolveFilters(cfg, discovered, data.Model)
 			if !ok {
 				next.ServeHTTP(w, r)
 				return
@@ -77,7 +77,7 @@ func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
 // Non-multipart requests pass through untouched. When a rewrite is needed the
 // form is reconstructed and re-attached with Content-Type / Content-Length
 // cleanup so the downstream reverse proxy forwards the correct bytes.
-func CreateFormFilterMiddleware(cfg config.Config) chain.Middleware {
+func CreateFormFilterMiddleware(cfg config.Config, discovered *discovery.Manager) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
@@ -91,7 +91,7 @@ func CreateFormFilterMiddleware(cfg config.Config) chain.Middleware {
 				return
 			}
 
-			useModelName, _, ok := resolveFilters(cfg, data.Model)
+			useModelName, _, ok := resolveFilters(cfg, discovered, data.Model)
 			if !ok || useModelName == "" {
 				next.ServeHTTP(w, r)
 				return
@@ -167,15 +167,15 @@ func rewriteMultipartModel(form *multipart.Form, useModelName string) ([]byte, s
 }
 
 // resolveFilters returns the filter settings for a requested model. UseModelName
-// only applies to local models; peers carry filters but no name rewrite.
-func resolveFilters(cfg config.Config, requested string) (useModelName string, filters config.Filters, ok bool) {
+// only applies to local models; discovered peers may rewrite FQ IDs.
+func resolveFilters(cfg config.Config, discovered *discovery.Manager, requested string) (useModelName string, filters config.Filters, ok bool) {
 	if realName, found := cfg.RealModelName(requested); found {
 		mc := cfg.Models[realName]
 		return mc.UseModelName, mc.Filters.Filters, true
 	}
-	for _, peer := range cfg.Peers {
-		if slices.Contains(peer.Models, requested) {
-			return "", peer.Filters, true
+	if discovered != nil {
+		if res := discovered.ResolveFilters(requested); res.OK {
+			return res.UseModelName, res.Filters, true
 		}
 	}
 	return "", config.Filters{}, false

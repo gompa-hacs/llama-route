@@ -732,6 +732,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		config.Peers[peerName] = peerConfig
 	}
 
+	if err := validatePeerIDs(config); err != nil {
+		return Config{}, err
+	}
+
 	config.Admin.Password = strings.TrimSpace(config.Admin.Password)
 	if err := validateAdminConfig(config.Admin); err != nil {
 		return Config{}, err
@@ -741,6 +745,23 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 
 	return config, nil
+}
+
+// validatePeerIDs ensures peer map keys are safe for peerID/modelID namespaces
+// and do not collide with local model IDs.
+func validatePeerIDs(config Config) error {
+	for peerID := range config.Peers {
+		if peerID == "" {
+			return fmt.Errorf("peers: peer ID must not be empty")
+		}
+		if strings.Contains(peerID, "/") {
+			return fmt.Errorf("peers: peer ID %q must not contain '/'", peerID)
+		}
+		if _, exists := config.Models[peerID]; exists {
+			return fmt.Errorf("peers: peer ID %q collides with a local model ID", peerID)
+		}
+	}
+	return nil
 }
 
 // rewrites the yaml to include a default group with any orphaned models

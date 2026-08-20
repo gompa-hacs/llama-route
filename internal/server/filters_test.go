@@ -124,7 +124,7 @@ func TestServer_FormFilterMiddleware(t *testing.T) {
 		_ = r.ParseMultipartForm(32 << 20)
 		gotModel = r.MultipartForm.Value["model"][0]
 	})
-	CreateFormFilterMiddleware(cfg)(final).ServeHTTP(httptest.NewRecorder(), r)
+	CreateFormFilterMiddleware(cfg, nil)(final).ServeHTTP(httptest.NewRecorder(), r)
 
 	if gotModel != "whisper-large-v3" {
 		t.Errorf("model rewritten to %q, want whisper-large-v3", gotModel)

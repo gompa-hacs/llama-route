@@ -14,6 +14,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/discovery"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/peermetrics"
 	"github.com/mostlygeek/llama-swap/internal/perf"
@@ -38,9 +39,11 @@ type Server struct {
 	build       BuildInfo
 
 	local router.LocalRouter
-	peer  router.Router
-	pool  router.Router
+	peer  *router.Peer
+	pool  *router.Pool
 	auth  *auth.Manager
+
+	discovery *discovery.Manager
 
 	mux     *http.ServeMux
 	handler http.Handler
@@ -163,9 +166,15 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		shutdownCtx: shutdownCtx,
 		shutdownFn:  shutdownFn,
 	}
+	if len(cfg.Peers) > 0 {
+		s.discovery = discovery.NewManager(cfg, proxylog, pool, peer)
+	}
 	s.routes()
 	s.startPreload()
 	s.peerMetrics.Start(s.shutdownCtx)
+	if s.discovery != nil {
+		s.discovery.Start(s.shutdownCtx)
+	}
 	return s, nil
 }
 
@@ -215,8 +224,8 @@ func (s *Server) routes() {
 		CreateRequestContextMiddleware(s.cfg),
 		CreateKeyLimitsMiddleware(s.cfg),
 		CreateStripClientAuthMiddleware(),
-		CreateFilterMiddleware(s.cfg),
-		CreateFormFilterMiddleware(s.cfg),
+		CreateFilterMiddleware(s.cfg, s.discovery),
+		CreateFormFilterMiddleware(s.cfg, s.discovery),
 		CreateInflightMiddleware(s.inflight),
 		CreateMetricsMiddleware(s.metrics, s.cfg),
 	)
@@ -309,6 +318,9 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 		return nil
 	}
 	s.shutdownFn()
+	if s.discovery != nil {
+		s.discovery.Stop()
+	}
 	if s.peerMetrics != nil {
 		s.peerMetrics.Stop()
 	}

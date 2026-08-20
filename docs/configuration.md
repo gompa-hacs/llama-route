@@ -576,19 +576,27 @@ hooks:
     preload:
       - "llama"
 
-# peers: a dictionary of remote peers and models they provide
+# peers: remote OpenAI-compatible servers whose models are auto-discovered
 # - optional, default empty dictionary
-# - peers can be another llama-swap
-# - peers can be any server that provides the /v1/ generative api endpoints supported by llama-swap
+# - peers can be another llama-swap or any server that exposes /v1/models
+# - every 30s llama-swap GETs {proxy}/v1/models and refreshes routes
+# - peer IDs must not contain '/' and must not collide with local model IDs
+# - discovery rules:
+#   - same model ID + same context_length on ≥2 peers → sticky auto-pool under the bare ID
+#   - same model ID + different context sizes → only peerID/modelID (no bare name)
+#   - unique model → bare ID plus peerID/modelID
+#   - local models: entries always win the bare name; FQ peer names still work
+# - peers without a working /v1/models contribute nothing until the endpoint responds
 peers:
-  # keys is the peer'd ID
+  # keys is the peer ID (used in peerID/modelID namespaces)
   llama-swap-peer:
     # proxy: a valid base URL to proxy requests to
     # - required
     # - requested path to llama-swap will be appended to the end of the proxy value
     proxy: http://192.168.1.23
-    # models: a list of models served by the peer
-    # - required
+    # models: optional allowlist of model IDs to import from discovery
+    # - optional, default: empty (accept all discovered models)
+    # - when set, only listed IDs from the peer's /v1/models are imported
     models:
       - model_a
       - model_b
@@ -601,6 +609,7 @@ peers:
     # - key will be injected into headers: Authorization: Bearer <key> and x-api-key: <key>
     # - can be a string or a macro
     apiKey: ${env.OPENROUTER_API_KEY}
+    # Recommended for large catalogs (OpenRouter, etc.): allowlist what you need.
     models:
       - meta-llama/llama-3.1-8b-instruct
       - qwen/qwen3-235b-a22b-2507

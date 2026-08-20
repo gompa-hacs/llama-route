@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/discovery"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
@@ -58,12 +60,13 @@ func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 
 func (s *stubRouter) UpstreamContextLength(modelID string) int { return 0 }
 
-// newTestServer wires a Server with stub routers and a built mux.
-func newTestServer(local router.LocalRouter, peer router.Router) *Server {
+// newTestServer wires a Server with a stub local router, empty peer/pool, and a built mux.
+func newTestServer(local router.LocalRouter) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	proxylog := logmon.NewWriter(io.Discard)
 	authMgr, _ := auth.NewManager(config.Config{})
 	pool, _ := router.NewPool(config.Config{}, proxylog, proxylog)
+	peer, _ := router.NewPeer(config.Config{}, proxylog)
 	s := &Server{
 		cfg:         config.Config{},
 		muxlog:      logmon.NewWriter(io.Discard),
@@ -125,7 +128,6 @@ func TestServer_New_MatrixConfig(t *testing.T) {
 func TestServer_RouteToLocalModel(t *testing.T) {
 	s := newTestServer(
 		newStubRouter([]string{"local-model"}, "local response"),
-		newStubRouter(nil, ""),
 	)
 
 	w := httptest.NewRecorder()
@@ -140,10 +142,27 @@ func TestServer_RouteToLocalModel(t *testing.T) {
 }
 
 func TestServer_RouteToPeerModel(t *testing.T) {
-	s := newTestServer(
-		newStubRouter(nil, ""),
-		newStubRouter([]string{"peer-model"}, "peer response"),
-	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("peer response"))
+	}))
+	defer upstream.Close()
+
+	proxyURL, _ := url.Parse(upstream.URL)
+	peers := config.PeerDictionaryConfig{
+		"peer1": {Proxy: upstream.URL, ProxyURL: proxyURL},
+	}
+	proxylog := logmon.NewWriter(io.Discard)
+	peer, err := router.NewPeer(config.Config{Peers: peers}, proxylog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = peer.ReplaceDiscovered(map[string]discovery.PeerRoute{
+		"peer-model": {PeerID: "peer1", UpstreamModelID: "peer-model"},
+	})
+
+	s := newTestServer(newStubRouter(nil, ""))
+	s.peer = peer
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, chatRequest("peer-model"))
@@ -159,7 +178,6 @@ func TestServer_RouteToPeerModel(t *testing.T) {
 func TestServer_UnknownModelReturns404(t *testing.T) {
 	s := newTestServer(
 		newStubRouter([]string{"local-model"}, ""),
-		newStubRouter(nil, ""),
 	)
 
 	w := httptest.NewRecorder()
@@ -171,7 +189,7 @@ func TestServer_UnknownModelReturns404(t *testing.T) {
 }
 
 func TestServer_UnknownPathReturns404(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/does-not-exist", nil))
@@ -182,7 +200,7 @@ func TestServer_UnknownPathReturns404(t *testing.T) {
 }
 
 func TestServer_Health(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	for _, path := range []string{"/health", "/wol-health"} {
 		w := httptest.NewRecorder()
@@ -194,7 +212,7 @@ func TestServer_Health(t *testing.T) {
 }
 
 func TestServer_CORSPreflight(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
 	w := httptest.NewRecorder()
@@ -210,7 +228,7 @@ func TestServer_CORSPreflight(t *testing.T) {
 
 func TestServer_Unload(t *testing.T) {
 	local := newStubRouter([]string{"m1"}, "")
-	s := newTestServer(local, newStubRouter(nil, ""))
+	s := newTestServer(local)
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/unload", nil))
@@ -226,7 +244,7 @@ func TestServer_Unload(t *testing.T) {
 func TestServer_Running(t *testing.T) {
 	local := newStubRouter([]string{"m1"}, "")
 	local.running = map[string]process.ProcessState{"m1": process.StateReady}
-	s := newTestServer(local, newStubRouter(nil, ""))
+	s := newTestServer(local)
 	s.cfg = config.Config{Models: map[string]config.ModelConfig{
 		"m1": {
 			Cmd:         "llama-server",
@@ -269,7 +287,7 @@ func TestServer_Running(t *testing.T) {
 
 func TestServer_Preload(t *testing.T) {
 	local := newStubRouter([]string{"m1"}, "ok")
-	s := newTestServer(local, newStubRouter(nil, ""))
+	s := newTestServer(local)
 	s.cfg = config.Config{Hooks: config.HooksConfig{
 		OnStartup: config.HookOnStartup{Preload: []string{"m1"}},
 	}}
@@ -292,8 +310,7 @@ func TestServer_Preload(t *testing.T) {
 
 func TestServer_Shutdown_StopsRoutersAndIsIdempotent(t *testing.T) {
 	local := newStubRouter([]string{"local-model"}, "")
-	peer := newStubRouter(nil, "")
-	s := newTestServer(local, peer)
+	s := newTestServer(local)
 
 	if err := s.Shutdown(time.Second); err != nil {
 		t.Fatalf("Shutdown: %v", err)
@@ -304,9 +321,6 @@ func TestServer_Shutdown_StopsRoutersAndIsIdempotent(t *testing.T) {
 	if got := local.shutdownCalls.Load(); got != 1 {
 		t.Errorf("local shutdownCalls=%d want 1", got)
 	}
-	if got := peer.shutdownCalls.Load(); got != 1 {
-		t.Errorf("peer shutdownCalls=%d want 1", got)
-	}
 }
 
 func TestServer_LogStream_ModelID(t *testing.T) {
@@ -316,7 +330,7 @@ func TestServer_LogStream_ModelID(t *testing.T) {
 	local := newStubRouter([]string{"mymodel"}, "")
 	local.loggers = map[string]*logmon.Monitor{"mymodel": buf}
 
-	s := newTestServer(local, newStubRouter(nil, ""))
+	s := newTestServer(local)
 	s.cfg = config.Config{Models: map[string]config.ModelConfig{"mymodel": {}}}
 
 	// Pre-cancel the context so the streaming loop exits immediately after
@@ -337,7 +351,7 @@ func TestServer_LogStream_ModelID(t *testing.T) {
 }
 
 func TestServer_LogStream_UnknownID_Returns400(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/logs/stream/no-such-model", nil))

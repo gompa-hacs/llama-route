@@ -10,21 +10,32 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/discovery"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
 func TestServer_HandleListModels(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 	s.cfg = config.Config{
 		Models: map[string]config.ModelConfig{
 			"visible": {Name: "Visible", Description: "a model"},
 			"hidden":  {Unlisted: true},
 		},
 		Peers: config.PeerDictionaryConfig{
-			"peer1": {Models: []string{"remote-model"}},
+			"peer1": {Proxy: "http://127.0.0.1:9"},
 		},
 	}
+	s.discovery = discovery.NewManager(s.cfg, s.proxylog, nil, nil)
+	s.discovery.SetPlanForTest(discovery.RoutePlan{
+		Listings: []discovery.Listing{{
+			ID:              "remote-model",
+			PeerID:          "peer1",
+			UpstreamModelID: "remote-model",
+			Discovered:      true,
+		}},
+	})
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -63,9 +74,6 @@ func TestServer_HandleListModels_FilteredByAPIKey(t *testing.T) {
 			"llama-70b": {Name: "Llama"},
 			"whisper":   {Name: "Whisper"},
 		},
-		Peers: config.PeerDictionaryConfig{
-			"peer1": {Models: []string{"remote-model"}},
-		},
 		Admin: config.AdminConfig{KeysFile: dir + "/keys.json"},
 	}
 	mgr, err := auth.NewManager(cfg)
@@ -77,7 +85,7 @@ func TestServer_HandleListModels_FilteredByAPIKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 	s.cfg = cfg
 	s.auth = mgr
 	s.routes() // rebuild mux so inference auth sees the new key manager
@@ -111,7 +119,7 @@ func TestServer_HandleListModels_FilteredByAPIKey(t *testing.T) {
 }
 
 func TestServer_HandleListModels_Aliases(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 	s.cfg = config.Config{
 		IncludeAliasesInList: true,
 		Models: map[string]config.ModelConfig{
@@ -166,7 +174,7 @@ func TestServer_FindModelInPath(t *testing.T) {
 
 func TestServer_HandleUpstream(t *testing.T) {
 	local := newStubRouter([]string{"m1"}, "upstream-body")
-	s := newTestServer(local, newStubRouter(nil, ""))
+	s := newTestServer(local)
 	s.cfg = config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
 
 	t.Run("proxies to local", func(t *testing.T) {
@@ -197,6 +205,8 @@ func TestServer_HandleUpstream(t *testing.T) {
 func upstreamMetricsServer(response string) *Server {
 	cfg := config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
 	proxylog := logmon.NewWriter(io.Discard)
+	peer, _ := router.NewPeer(config.Config{}, proxylog)
+	pool, _ := router.NewPool(config.Config{}, proxylog, proxylog)
 	s := &Server{
 		cfg:         cfg,
 		muxlog:      logmon.NewWriter(io.Discard),
@@ -205,7 +215,8 @@ func upstreamMetricsServer(response string) *Server {
 		inflight:    &inflightCounter{},
 		metrics:     newMetricsMonitor(proxylog, 10, 0),
 		local:       newStubRouter([]string{"m1"}, response),
-		peer:        newStubRouter(nil, ""),
+		peer:        peer,
+		pool:        pool,
 	}
 	s.routes()
 	return s
@@ -269,7 +280,7 @@ func TestServer_HandleUpstream_MetricsSkipsGET(t *testing.T) {
 }
 
 func TestServer_HandleMetrics_Unavailable(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -279,7 +290,7 @@ func TestServer_HandleMetrics_Unavailable(t *testing.T) {
 }
 
 func TestServer_Redirects(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	for path, want := range map[string]string{"/": "/ui", "/upstream": "/ui/models"} {
 		w := httptest.NewRecorder()
@@ -295,7 +306,7 @@ func TestServer_Redirects(t *testing.T) {
 
 func TestServer_HandleListModels_Capabilities(t *testing.T) {
 	newServer := func(mc config.ModelConfig) *Server {
-		s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+		s := newTestServer(newStubRouter(nil, ""))
 		s.cfg = config.Config{Models: map[string]config.ModelConfig{"m": mc}}
 		return s
 	}

@@ -509,8 +509,7 @@
             "additionalProperties": {
                 "type": "object",
                 "required": [
-                    "proxy",
-                    "models"
+                    "proxy"
                 ],
                 "properties": {
                     "proxy": {
@@ -529,7 +528,7 @@
                             "type": "string",
                             "minLength": 1
                         },
-                        "description": "A list of models served by the peer."
+                        "description": "Optional allowlist of model IDs to import from the peer's /v1/models. Empty or omitted accepts all discovered models."
                     },
                     "filters": {
                         "type": "object",
@@ -591,7 +590,7 @@
                 }
             },
             "default": {},
-            "description": "A dictionary of remote peers and models they provide. Peers can be another llama-swap or any server that provides the /v1/ generative API endpoints supported by llama-swap."
+            "description": "A dictionary of remote peers. Models are discovered from each peer's /v1/models. peers.*.models is an optional allowlist. Peer IDs must not contain '/' and must not collide with local model IDs."
         },
         "routing": {
             "type": "object",

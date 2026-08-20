@@ -51,7 +51,7 @@ func TestServer_NewLoggers(t *testing.T) {
 }
 
 func TestServer_HandleLogs_Plain(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 	s.muxlog.Write([]byte("a log line"))
 
 	w := httptest.NewRecorder()
@@ -69,7 +69,7 @@ func TestServer_HandleLogs_Plain(t *testing.T) {
 }
 
 func TestServer_HandleLogs_HTMLRedirect(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 
 	req := httptest.NewRequest(http.MethodGet, "/logs", nil)
 	req.Header.Set("Accept", "text/html")

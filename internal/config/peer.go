@@ -53,11 +53,23 @@ func (c *PeerConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	defaults.ProxyURL = parsedURL
 
-	// Validate models is not empty
-	if len(defaults.Models) == 0 {
-		return fmt.Errorf("peer models can not be empty")
-	}
+	// Models is an optional allowlist for discovery. Empty/omitted means accept
+	// all models advertised by the peer's /v1/models endpoint.
 
 	*c = PeerConfig(defaults)
 	return nil
+}
+
+// AllowedModel reports whether modelID passes this peer's discovery allowlist.
+// An empty Models list allows every discovered model.
+func (c PeerConfig) AllowedModel(modelID string) bool {
+	if len(c.Models) == 0 {
+		return true
+	}
+	for _, m := range c.Models {
+		if m == modelID {
+			return true
+		}
+	}
+	return false
 }

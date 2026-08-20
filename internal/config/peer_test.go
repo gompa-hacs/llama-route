@@ -59,19 +59,19 @@ models:
 			wantErr: "invalid peer proxy URL",
 		},
 		{
-			name: "missing models",
+			name: "missing models is allowed (discover all)",
 			yaml: `
 proxy: http://localhost:8080
 `,
-			wantErr: "peer models can not be empty",
+			wantErr: "",
 		},
 		{
-			name: "empty models",
+			name: "empty models is allowed (discover all)",
 			yaml: `
 proxy: http://localhost:8080
 models: []
 `,
-			wantErr: "peer models can not be empty",
+			wantErr: "",
 		},
 	}
 
@@ -136,6 +136,52 @@ func searchSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestPeerConfig_AllowedModel(t *testing.T) {
+	empty := PeerConfig{}
+	if !empty.AllowedModel("anything") {
+		t.Fatal("empty allowlist should allow all")
+	}
+	listed := PeerConfig{Models: []string{"a", "b"}}
+	if !listed.AllowedModel("a") || listed.AllowedModel("c") {
+		t.Fatalf("allowlist mismatch: a=%v c=%v", listed.AllowedModel("a"), listed.AllowedModel("c"))
+	}
+}
+
+func TestValidatePeerIDs(t *testing.T) {
+	t.Run("slash in peer id", func(t *testing.T) {
+		err := validatePeerIDs(Config{
+			Peers: PeerDictionaryConfig{
+				"gpu/1": {Proxy: "http://localhost:1"},
+			},
+		})
+		if err == nil || !contains(err.Error(), "must not contain '/'") {
+			t.Fatalf("got %v", err)
+		}
+	})
+	t.Run("collision with local model", func(t *testing.T) {
+		err := validatePeerIDs(Config{
+			Models: map[string]ModelConfig{"gpu1": {}},
+			Peers: PeerDictionaryConfig{
+				"gpu1": {Proxy: "http://localhost:1"},
+			},
+		})
+		if err == nil || !contains(err.Error(), "collides") {
+			t.Fatalf("got %v", err)
+		}
+	})
+	t.Run("ok", func(t *testing.T) {
+		err := validatePeerIDs(Config{
+			Models: map[string]ModelConfig{"qwen": {}},
+			Peers: PeerDictionaryConfig{
+				"gpu1": {Proxy: "http://localhost:1"},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestPeerConfig_WithFilters(t *testing.T) {

@@ -18,16 +18,19 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/discovery"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 type poolBackend struct {
 	id           int
 	proxy        string
+	apiKey       string
 	reverseProxy *httputil.ReverseProxy
 	healthy      atomic.Bool
 
@@ -42,11 +45,13 @@ type poolBackend struct {
 }
 
 type poolModel struct {
-	modelID   string
-	cfg       config.ModelConfig
-	rules     []config.AffinityRule
-	ttl       time.Duration
-	startMode string
+	modelID         string
+	upstreamModelID string // rewrite request model when serving FQ aliases
+	cfg             config.ModelConfig
+	rules           []config.AffinityRule
+	ttl             time.Duration
+	startMode       string
+	discovered      bool // owned by ReplaceDiscovered; YAML pools stay false
 
 	backends     []poolBackend
 	contextSizes []atomic.Int64 // parallel to backends; 0 = unknown/unlimited
@@ -68,6 +73,7 @@ type Pool struct {
 	logger      *logmon.Monitor
 	upstreamlog *logmon.Monitor
 	models      map[string]*poolModel
+	modelsMu    sync.RWMutex
 
 	shutdownCtx  context.Context
 	shutdownFn   context.CancelFunc
@@ -133,6 +139,8 @@ func NewPool(cfg config.Config, proxylog, upstreamlog *logmon.Monitor) (*Pool, e
 }
 
 func (p *Pool) uniqueModels() []*poolModel {
+	p.modelsMu.RLock()
+	defer p.modelsMu.RUnlock()
 	seen := make(map[*poolModel]struct{}, len(p.models))
 	out := make([]*poolModel, 0, len(p.models))
 	for _, pm := range p.models {
@@ -329,14 +337,118 @@ func (pm *poolModel) clearAffinityFor(backendID int) {
 }
 
 func (p *Pool) Handles(model string) bool {
+	p.modelsMu.RLock()
+	defer p.modelsMu.RUnlock()
 	_, ok := p.models[model]
 	return ok
+}
+
+// ReplaceDiscovered swaps discovery-owned auto-pools. YAML-configured pools are
+// left untouched. route keys (bare + FQ) all map to the same poolModel.
+func (p *Pool) ReplaceDiscovered(pools []discovery.DiscoveredPool) error {
+	p.modelsMu.Lock()
+	defer p.modelsMu.Unlock()
+
+	// Drop previous discovery-owned entries.
+	for key, pm := range p.models {
+		if pm.discovered {
+			delete(p.models, key)
+		}
+	}
+
+	for _, spec := range pools {
+		if len(spec.Backends) == 0 || len(spec.RouteKeys) == 0 {
+			continue
+		}
+		// Do not override YAML pool / alias keys.
+		skip := false
+		for _, key := range spec.RouteKeys {
+			if existing, ok := p.models[key]; ok && !existing.discovered {
+				p.logger.Warnf("discovery pool: route key %q owned by config, skipping pool %s", key, spec.CanonicalID)
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+
+		pm, err := p.newDiscoveredPoolModel(spec)
+		if err != nil {
+			return err
+		}
+		for _, key := range spec.RouteKeys {
+			p.models[key] = pm
+		}
+	}
+	return nil
+}
+
+func (p *Pool) newDiscoveredPoolModel(spec discovery.DiscoveredPool) (*poolModel, error) {
+	n := len(spec.Backends)
+	mc := config.ModelConfig{
+		Pool: &config.PoolConfig{
+			Strategy: "sticky_least_inflight",
+		},
+		Timeouts: config.TimeoutsConfig{
+			Connect:        30,
+			KeepAlive:      30,
+			ResponseHeader: 60,
+			TLSHandshake:   10,
+			ExpectContinue: 1,
+			IdleConn:       90,
+		},
+		HealthCheckTimeout: 120,
+	}
+	// Populate backends on Pool config for buildBackend.
+	backends := make([]config.PoolBackend, n)
+	for i, b := range spec.Backends {
+		proxyURL, err := url.Parse(b.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("discovered pool %s backend %d: %w", spec.CanonicalID, i, err)
+		}
+		backends[i] = config.PoolBackend{
+			Proxy:       b.Proxy,
+			ProxyURL:    proxyURL,
+			ContextSize: b.ContextSize,
+		}
+	}
+	mc.Pool.Backends = backends
+
+	pm := &poolModel{
+		modelID:         spec.CanonicalID,
+		upstreamModelID: spec.UpstreamModelID,
+		cfg:             mc,
+		rules:           config.DefaultAffinityRules(),
+		ttl:             30 * time.Minute,
+		startMode:       "on_demand",
+		discovered:      true,
+		backends:        make([]poolBackend, n),
+		contextSizes:    make([]atomic.Int64, n),
+		inflight:        make([]int, n),
+		affinity:        make(map[string]affinityEntry),
+	}
+
+	healthTimeout := 15 * time.Second
+	for i, b := range backends {
+		if err := p.buildBackend(spec.CanonicalID, mc, i, b, healthTimeout, &pm.backends[i]); err != nil {
+			return nil, err
+		}
+		pm.backends[i].model = pm
+		pm.backends[i].apiKey = spec.Backends[i].ApiKey
+		if b.ContextSize > 0 {
+			pm.contextSizes[i].Store(int64(b.ContextSize))
+		}
+	}
+	return pm, nil
 }
 
 // Preload starts all spawn backends for models with pool.start: preload.
 // Also starts spawn backends when modelID is listed in hooks preload.
 func (p *Pool) Preload(modelID string) {
+	p.modelsMu.RLock()
 	pm, ok := p.models[modelID]
+	p.modelsMu.RUnlock()
 	if !ok {
 		return
 	}
@@ -409,7 +521,9 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	p.modelsMu.RLock()
 	pm, ok := p.models[data.ModelID]
+	p.modelsMu.RUnlock()
 	if !ok {
 		shared.SendError(w, req, ErrNoRouterFound)
 		return
@@ -443,6 +557,19 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	defer pm.trackDone(backendID)
 
+	if backend.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+backend.apiKey)
+		req.Header.Set("x-api-key", backend.apiKey)
+	}
+
+	// Rewrite FQ client model IDs to the upstream-native ID when needed.
+	if pm.upstreamModelID != "" && data.Model != pm.upstreamModelID {
+		if err := rewriteRequestModel(req, pm.upstreamModelID); err != nil {
+			shared.SendError(w, req, err)
+			return
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	stopReq := context.AfterFunc(req.Context(), cancel)
 	stopShutdown := context.AfterFunc(p.shutdownCtx, cancel)
@@ -457,6 +584,28 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	stopShutdown()
 	stopReq()
 	cancel()
+}
+
+// rewriteRequestModel sets the JSON "model" field when the body is JSON.
+func rewriteRequestModel(req *http.Request, modelID string) error {
+	ct := req.Header.Get("Content-Type")
+	if !strings.Contains(ct, "application/json") || req.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return fmt.Errorf("reading body for model rewrite: %w", err)
+	}
+	_ = req.Body.Close()
+	body, err = sjson.SetBytes(body, "model", modelID)
+	if err != nil {
+		return fmt.Errorf("rewriting model: %w", err)
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	req.Header.Del("Transfer-Encoding")
+	return nil
 }
 
 // pickAndTrack selects an eligible backend and increments its inflight counter.
@@ -613,14 +762,17 @@ func (p *Pool) Stats() shared.PoolMetricsSnapshot {
 		Timestamp: time.Now(),
 		Models:    make([]shared.PoolModelMetric, 0),
 	}
-	if p == nil || len(p.models) == 0 {
+	if p == nil {
 		return snap
 	}
 
+	p.modelsMu.RLock()
 	unique := make(map[string]*poolModel, len(p.models))
 	for _, pm := range p.models {
 		unique[pm.modelID] = pm
 	}
+	p.modelsMu.RUnlock()
+
 	ids := make([]string, 0, len(unique))
 	for id := range unique {
 		ids = append(ids, id)
@@ -676,9 +828,6 @@ func (pm *poolModel) stats() shared.PoolModelMetric {
 }
 
 func (p *Pool) startMetricsEmitter() {
-	if len(p.models) == 0 {
-		return
-	}
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()

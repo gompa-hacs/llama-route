@@ -245,7 +245,7 @@ func TestServer_AdminAuthMiddleware_SessionOnly(t *testing.T) {
 }
 
 func TestServer_UI_PublicWhenAdminRequired(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 	mgr, err := auth.NewManager(config.Config{Admin: config.AdminConfig{Password: "pw"}})
 	if err != nil {
 		t.Fatal(err)
@@ -284,7 +284,7 @@ func TestServer_StripClientAuthMiddleware(t *testing.T) {
 }
 
 func TestServer_AuthLogin_SecureCookieBehindProxy(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s := newTestServer(newStubRouter(nil, ""))
 	mgr, err := auth.NewManager(config.Config{Admin: config.AdminConfig{Password: "pw"}})
 	if err != nil {
 		t.Fatal(err)
