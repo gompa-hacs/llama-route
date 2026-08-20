@@ -32,26 +32,26 @@ func DefaultFetcherConfig() FetcherConfig {
 
 // PeerSnapshot holds metrics and performance data from a single peer.
 type PeerSnapshot struct {
-	PeerName string          `json:"peer_name"`
-	Success  bool            `json:"success"`
-	Error    string          `json:"error,omitempty"`
+	PeerName string                   `json:"peer_name"`
+	Success  bool                     `json:"success"`
+	Error    string                   `json:"error,omitempty"`
 	Metrics  []shared.PeerMetricEntry `json:"metrics,omitempty"`
-	SysStats []perf.SysStat  `json:"sys_stats,omitempty"`
-	GpuStats []perf.GpuStat  `json:"gpu_stats,omitempty"`
-	LastSeen time.Time       `json:"last_seen"`
+	SysStats []perf.SysStat           `json:"sys_stats,omitempty"`
+	GpuStats []perf.GpuStat           `json:"gpu_stats,omitempty"`
+	LastSeen time.Time                `json:"last_seen"`
 }
 
 // LatestPeerMetrics holds aggregated data from all peers at a single poll.
 type LatestPeerMetrics struct {
-	PollTime  time.Time               `json:"poll_time"`
-	Peers     map[string]PeerSnapshot `json:"peers"`
+	PollTime time.Time               `json:"poll_time"`
+	Peers    map[string]PeerSnapshot `json:"peers"`
 }
 
 // Fetcher periodically polls peers for their metrics and performance data.
 type Fetcher struct {
-	peers   config.PeerDictionaryConfig
-	cfg     FetcherConfig
-	logger  *logmon.Monitor
+	peers  config.PeerDictionaryConfig
+	cfg    FetcherConfig
+	logger *logmon.Monitor
 
 	mu      sync.RWMutex
 	latest  LatestPeerMetrics
@@ -194,10 +194,10 @@ func (f *Fetcher) pollPeer(name string, peer config.PeerConfig) PeerSnapshot {
 	if resp.StatusCode == http.StatusOK {
 		// Decode the ActivityLogEntry array and convert to PeerMetricEntry.
 		var entries []struct {
-			Model           string    `json:"model"`
-			Timestamp       time.Time `json:"timestamp"`
-			ReqPath         string    `json:"req_path"`
-			Tokens          struct {
+			Model     string    `json:"model"`
+			Timestamp time.Time `json:"timestamp"`
+			ReqPath   string    `json:"req_path"`
+			Tokens    struct {
 				InputTokens  int `json:"input_tokens"`
 				OutputTokens int `json:"output_tokens"`
 			} `json:"tokens"`
@@ -214,10 +214,10 @@ func (f *Fetcher) pollPeer(name string, peer config.PeerConfig) PeerSnapshot {
 		metrics := make([]shared.PeerMetricEntry, 0, len(entries))
 		for _, e := range entries {
 			metrics = append(metrics, shared.PeerMetricEntry{
-				PeerName:   name,
-				Model:      e.Model,
-				Timestamp:  e.Timestamp,
-				ReqPath:    e.ReqPath,
+				PeerName:  name,
+				Model:     e.Model,
+				Timestamp: e.Timestamp,
+				ReqPath:   e.ReqPath,
 				Tokens: map[string]int{
 					"input_tokens":  e.Tokens.InputTokens,
 					"output_tokens": e.Tokens.OutputTokens,
