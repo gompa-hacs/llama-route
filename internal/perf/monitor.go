@@ -31,10 +31,7 @@ type Monitor struct {
 }
 
 func ringCapacity(c config.PerformanceConfig) int {
-	n := int(time.Hour / c.Every)
-	if n < 1 {
-		n = 1
-	}
+	n := max(int(time.Hour/c.Every), 1)
 	return n
 }
 
@@ -149,34 +146,48 @@ func (m *Monitor) Start() {
 	}()
 
 	go func() {
-		gpuCh, err := getGpuStats(m.stopCtx, m.conf.Every, m.log)
-		if err != nil {
-			if errors.Is(err, ErrNotImplemented) || errors.Is(err, ErrNoGpuTool) {
-				m.log.Infof("GPU monitoring not available: %s", err.Error())
-			} else {
-				m.log.Errorf("failed to initialize GPU monitoring: %s", err.Error())
-			}
-			return
-		}
-
 		for {
+			if m.stopCtx.Err() != nil {
+				return
+			}
+
+			gpuCh, err := getGpuStats(m.stopCtx, m.conf.Every, m.log)
+			if err != nil {
+				if errors.Is(err, ErrNotImplemented) || errors.Is(err, ErrNoGpuTool) {
+					m.log.Infof("GPU monitoring not available: %s", err.Error())
+				} else {
+					m.log.Errorf("failed to initialize GPU monitoring: %s", err.Error())
+				}
+				return
+			}
+
+			stopped := false
+			for !stopped {
+				select {
+				case <-m.stopCtx.Done():
+					return
+				case g, ok := <-gpuCh:
+					if !ok {
+						m.log.Warn("GPU stats channel closed, restarting GPU monitoring")
+						stopped = true
+						break
+					}
+					m.mutex.Lock()
+					m.gpuRing.Push(g)
+					for l := range m.gpuListeners {
+						select {
+						case l <- g:
+						default:
+						}
+					}
+					m.mutex.Unlock()
+				}
+			}
+
 			select {
 			case <-m.stopCtx.Done():
 				return
-			case g, ok := <-gpuCh:
-				if !ok {
-					m.log.Errorf("failed reading from gpuCh - stopping read goroutine")
-					return
-				}
-				m.mutex.Lock()
-				m.gpuRing.Push(g)
-				for l := range m.gpuListeners {
-					select {
-					case l <- g:
-					default:
-					}
-				}
-				m.mutex.Unlock()
+			case <-time.After(time.Second):
 			}
 		}
 	}()

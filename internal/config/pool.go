@@ -35,8 +35,15 @@ type PoolBackend struct {
 	Env         []string `yaml:"env"`
 	// CheckEndpoint overrides the model-level health check path for this backend.
 	CheckEndpoint string `yaml:"checkEndpoint"`
+	// Compat selects upstream protocol shims (e.g. "whisper"). Empty inherits
+	// the model-level compat value.
+	Compat string `yaml:"compat"`
 
 	ProxyURL *url.URL `yaml:"-"`
+
+	// WhisperCompat is set during config load when OpenAI→/inference rewrite
+	// should be applied for this backend.
+	WhisperCompat bool `yaml:"-"`
 }
 
 // IsSpawn reports whether this backend is started by llama-swap.
@@ -69,8 +76,12 @@ func (p *PoolConfig) AffinityDuration() time.Duration {
 		return 30 * time.Minute
 	}
 	d, err := time.ParseDuration(p.AffinityTTL)
-	if err != nil || d <= 0 {
+	if err != nil {
 		return 30 * time.Minute
+	}
+	// 0 disables sticky affinity mappings.
+	if d <= 0 {
+		return 0
 	}
 	return d
 }
@@ -131,7 +142,7 @@ func validatePoolConfig(modelID string, pool *PoolConfig, modelCmd string) error
 		return fmt.Errorf("model %s: pool.start %q is not supported (valid: on_demand, preload)", modelID, pool.Start)
 	}
 	if pool.AffinityTTL != "" {
-		if d, err := time.ParseDuration(pool.AffinityTTL); err != nil || d <= 0 {
+		if _, err := time.ParseDuration(pool.AffinityTTL); err != nil {
 			return fmt.Errorf("model %s: invalid pool.affinityTTL %q", modelID, pool.AffinityTTL)
 		}
 	}
@@ -198,9 +209,45 @@ func defaultAffinityRules() []AffinityRule {
 	}
 }
 
+// DefaultAffinityRules is the sticky-session rule chain used when pool.affinity
+// is omitted.
+func DefaultAffinityRules() []AffinityRule {
+	return defaultAffinityRules()
+}
+
 func (p *PoolConfig) EffectiveAffinityRules() []AffinityRule {
 	if p == nil || len(p.Affinity) == 0 {
 		return defaultAffinityRules()
 	}
 	return p.Affinity
+}
+
+// ResolveAffinityRules returns the affinity rules for a pool model.
+// Explicit pool.affinity wins. Otherwise whisper.cpp backends get no sticky
+// rules (API-key stickiness would pin all transcriptions to one GPU). Other
+// pools keep the default LLM-oriented chain.
+func ResolveAffinityRules(p *PoolConfig) []AffinityRule {
+	if p == nil {
+		return defaultAffinityRules()
+	}
+	if len(p.Affinity) > 0 {
+		return p.Affinity
+	}
+	if p.AllWhisperCompat() {
+		return []AffinityRule{}
+	}
+	return defaultAffinityRules()
+}
+
+// AllWhisperCompat reports whether every backend uses whisper.cpp path rewriting.
+func (p *PoolConfig) AllWhisperCompat() bool {
+	if p == nil || len(p.Backends) == 0 {
+		return false
+	}
+	for _, b := range p.Backends {
+		if !b.WhisperCompat {
+			return false
+		}
+	}
+	return true
 }

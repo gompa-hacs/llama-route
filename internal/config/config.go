@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -92,7 +93,7 @@ var (
 )
 
 // set default values for GroupConfig
-func (c *GroupConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (c *GroupConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	type rawGroupConfig GroupConfig
 	defaults := rawGroupConfig{
 		Swap:       true,
@@ -353,8 +354,8 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		}
 
 		// Substitute remaining macros in model fields (LIFO order)
-		for i := len(mergedMacros) - 1; i >= 0; i-- {
-			entry := mergedMacros[i]
+		for _, entry := range slices.Backward(mergedMacros) {
+
 			macroSlug := fmt.Sprintf("${%s}", entry.Name)
 			macroStr := fmt.Sprintf("%v", entry.Value)
 
@@ -469,6 +470,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			if err := finalizePoolBackendURLs(modelId, modelConfig.Pool); err != nil {
 				return Config{}, err
 			}
+		}
+
+		if err := applyWhisperCompat(modelId, &modelConfig); err != nil {
+			return Config{}, err
 		}
 
 		// Validate no unknown macros remain
@@ -694,8 +699,8 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	// Process peers with global macro substitution
 	for peerName, peerConfig := range config.Peers {
 		// Substitute global macros (LIFO order)
-		for i := len(config.Macros) - 1; i >= 0; i-- {
-			entry := config.Macros[i]
+		for _, entry := range slices.Backward(config.Macros) {
+
 			macroSlug := fmt.Sprintf("${%s}", entry.Name)
 			macroStr := fmt.Sprintf("%v", entry.Value)
 
@@ -785,15 +790,15 @@ func AddDefaultGroupToConfig(config Config) Config {
 
 func SanitizeCommand(cmdStr string) ([]string, error) {
 	var cleanedLines []string
-	for _, line := range strings.Split(cmdStr, "\n") {
+	for line := range strings.SplitSeq(cmdStr, "\n") {
 		trimmed := strings.TrimSpace(line)
 		// Skip comment lines
 		if strings.HasPrefix(trimmed, "#") {
 			continue
 		}
 		// Handle trailing backslashes by replacing with space
-		if strings.HasSuffix(trimmed, "\\") {
-			cleanedLines = append(cleanedLines, strings.TrimSuffix(trimmed, "\\")+" ")
+		if before, ok := strings.CutSuffix(trimmed, "\\"); ok {
+			cleanedLines = append(cleanedLines, before+" ")
 		} else {
 			cleanedLines = append(cleanedLines, line)
 		}
@@ -820,7 +825,7 @@ func SanitizeCommand(cmdStr string) ([]string, error) {
 
 func StripComments(cmdStr string) string {
 	var cleanedLines []string
-	for _, line := range strings.Split(cmdStr, "\n") {
+	for line := range strings.SplitSeq(cmdStr, "\n") {
 		trimmed := strings.TrimSpace(line)
 		// Skip comment lines
 		if strings.HasPrefix(trimmed, "#") {

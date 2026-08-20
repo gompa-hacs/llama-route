@@ -46,7 +46,7 @@ func tryNvidiaSmiWindows(ctx context.Context, every time.Duration, logger *logmo
 	}
 
 	cmd := exec.CommandContext(ctx, "nvidia-smi",
-		"--query-gpu=index,name,uuid,temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed,power.draw",
+		"--query-gpu=index,name,uuid,temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed,power.draw,clocks.current.graphics,clocks.current.memory",
 		"--format=csv,noheader,nounits",
 		"--loop", fmt.Sprintf("%d", sec),
 	)

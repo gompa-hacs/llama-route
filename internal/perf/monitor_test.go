@@ -213,14 +213,12 @@ func TestCurrent_ConcurrentAccess(t *testing.T) {
 	m.gpuRing.Push([]GpuStat{{Timestamp: time.Now(), ID: 0}})
 
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 10 {
+		wg.Go(func() {
 			sys, gpu := m.Current()
 			assert.Len(t, sys, 1)
 			assert.Len(t, gpu, 1)
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -241,6 +239,17 @@ func TestParseNvidiaSmiLine_ValidLine(t *testing.T) {
 	assert.Equal(t, 75.0, stat.FanSpeedPct)
 	assert.Equal(t, 250.0, stat.PowerDrawW)
 	assert.InDelta(t, 80.0, stat.MemUtilPct, 0.01)
+	assert.Equal(t, 0, stat.ClockMHz)
+	assert.Equal(t, 0, stat.MemClockMHz)
+}
+
+func TestParseNvidiaSmiLine_WithClocks(t *testing.T) {
+	line := "0, NVIDIA GeForce RTX 3080, GPU-123, 65, 80, 8192, 10240, 75, 250, 1800, 9500"
+
+	stat := ParseNvidiaSmiLine(line)
+	require.NotNil(t, stat)
+	assert.Equal(t, 1800, stat.ClockMHz)
+	assert.Equal(t, 9500, stat.MemClockMHz)
 }
 
 func TestParseNvidiaSmiLine_ShortLine(t *testing.T) {

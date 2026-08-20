@@ -98,6 +98,8 @@ export interface GpuStat {
   mem_total_mb: number;
   fan_speed_pct: number;
   power_draw_w: number;
+  clock_mhz: number;
+  mem_clock_mhz: number;
 }
 
 export interface PerformanceResponse {

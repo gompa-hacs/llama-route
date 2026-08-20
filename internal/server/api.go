@@ -6,10 +6,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/router"
@@ -110,12 +112,7 @@ func renderCapabilities(caps config.ModelCapConfig) (arch map[string]any, capsMa
 
 // contains reports whether s is present in ss.
 func contains(ss []string, s string) bool {
-	for _, v := range ss {
-		if v == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(ss, s)
 }
 
 // filterCappedMetadata returns metadata with renderer-owned keys removed.
@@ -182,10 +179,18 @@ func queryUpstreamContextLength(proxyURL string) int {
 }
 
 // handleListModels serves the OpenAI-compatible model listing: local models
-// (with optional aliases) plus peer models.
+// (with optional aliases) plus peer models. When the caller authenticated with
+// a UI-managed key that has a model allow-list, only permitted models are shown.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 	data := make([]modelRecord, 0, len(s.cfg.Models))
+	policy, hasPolicy := auth.KeyPolicyFromContext(r.Context())
+	allows := func(requested, modelID string) bool {
+		if !hasPolicy {
+			return true
+		}
+		return policy.AllowsModel(requested, modelID)
+	}
 
 	newRecord := func(id, name, description string, metadata map[string]any, caps config.ModelCapConfig, mc *config.ModelConfig) modelRecord {
 		rec := modelRecord{
@@ -224,11 +229,13 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		if mc.Unlisted {
 			continue
 		}
-		data = append(data, newRecord(id, mc.Name, mc.Description, mc.Metadata, mc.Capabilities, &mc))
+		if allows(id, id) {
+			data = append(data, newRecord(id, mc.Name, mc.Description, mc.Metadata, mc.Capabilities, &mc))
+		}
 
 		if s.cfg.IncludeAliasesInList {
 			for _, alias := range mc.Aliases {
-				if alias := strings.TrimSpace(alias); alias != "" {
+				if alias := strings.TrimSpace(alias); alias != "" && allows(alias, id) {
 					data = append(data, newRecord(alias, mc.Name, mc.Description, mc.Metadata, mc.Capabilities, &mc))
 				}
 			}
@@ -237,6 +244,9 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 	for peerID, peer := range s.cfg.Peers {
 		for _, modelID := range peer.Models {
+			if !allows(modelID, modelID) {
+				continue
+			}
 			data = append(data, newRecord(modelID, peerID+": "+modelID, "", map[string]any{"peerID": peerID}, config.ModelCapConfig{}, nil))
 		}
 	}

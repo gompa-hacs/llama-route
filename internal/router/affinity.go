@@ -15,9 +15,15 @@ import (
 
 // ExtractAffinityKey returns a stable session key from the request using the
 // configured rule chain. An empty string means no stickiness for this request.
+//
+// A nil rules slice uses the default LLM sticky chain. A non-nil empty slice
+// disables stickiness entirely (used for whisper.cpp pools).
 func ExtractAffinityKey(r *http.Request, rules []config.AffinityRule) string {
+	if rules == nil {
+		rules = config.DefaultAffinityRules()
+	}
 	if len(rules) == 0 {
-		rules = (&config.PoolConfig{}).EffectiveAffinityRules()
+		return ""
 	}
 
 	body := peekRequestBody(r)

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -43,23 +44,69 @@ type keyStore struct {
 }
 
 type storedKey struct {
-	ID       string    `json:"id"`
-	Name     string    `json:"name"`
-	Prefix   string    `json:"prefix"`
-	Hash     string    `json:"hash"`
-	Created  time.Time `json:"created"`
-	LastUsed time.Time `json:"lastUsed,omitempty"`
-	Revoked  bool      `json:"revoked,omitempty"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Prefix    string    `json:"prefix"`
+	Hash      string    `json:"hash"`
+	Created   time.Time `json:"created"`
+	LastUsed  time.Time `json:"lastUsed,omitzero"`
+	Revoked   bool      `json:"revoked,omitempty"`
+	Models    []string  `json:"models,omitempty"`
+	MaxTokens int64     `json:"maxTokens,omitempty"`
 }
 
 // PublicKey is returned by list/create APIs (never includes the secret).
 type PublicKey struct {
-	ID       string    `json:"id"`
-	Name     string    `json:"name"`
-	Prefix   string    `json:"prefix"`
-	Created  time.Time `json:"created"`
-	LastUsed time.Time `json:"lastUsed,omitempty"`
-	Revoked  bool      `json:"revoked,omitempty"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Prefix    string    `json:"prefix"`
+	Created   time.Time `json:"created"`
+	LastUsed  time.Time `json:"lastUsed,omitzero"`
+	Revoked   bool      `json:"revoked,omitempty"`
+	Models    []string  `json:"models,omitempty"`
+	MaxTokens int64     `json:"maxTokens,omitempty"`
+}
+
+// KeyLimits are optional restrictions applied to a UI-managed API key.
+// Empty Models means all models are allowed. MaxTokens of 0 means no cap.
+type KeyLimits struct {
+	Models    []string `json:"models"`
+	MaxTokens int64    `json:"maxTokens"`
+}
+
+// KeyPolicy is the effective access policy for an authenticated inference key.
+type KeyPolicy struct {
+	ID        string
+	Models    []string
+	MaxTokens int64
+	Static    bool
+}
+
+type keyPolicyContextKey struct{}
+
+// ContextWithKeyPolicy stores the authenticated key policy on the request context.
+func ContextWithKeyPolicy(ctx context.Context, p KeyPolicy) context.Context {
+	return context.WithValue(ctx, keyPolicyContextKey{}, p)
+}
+
+// KeyPolicyFromContext returns the policy attached by inference auth middleware.
+func KeyPolicyFromContext(ctx context.Context) (KeyPolicy, bool) {
+	p, ok := ctx.Value(keyPolicyContextKey{}).(KeyPolicy)
+	return p, ok
+}
+
+// AllowsModel reports whether the policy permits the requested model name or
+// its resolved model ID. An empty allow-list means unrestricted.
+func (p KeyPolicy) AllowsModel(requested, modelID string) bool {
+	if len(p.Models) == 0 {
+		return true
+	}
+	for _, m := range p.Models {
+		if m == requested || (modelID != "" && m == modelID) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewManager loads dynamic keys and prepares session state.
@@ -156,16 +203,25 @@ func (m *Manager) SessionValid(token string) bool {
 	return true
 }
 
+// ValidateInferenceKey reports whether key is a valid static or UI-managed key.
 func (m *Manager) ValidateInferenceKey(key string) bool {
+	_, ok := m.AuthenticateInferenceKey(key)
+	return ok
+}
+
+// AuthenticateInferenceKey validates key and returns its access policy.
+// Static YAML keys are unrestricted. UI-managed keys may restrict models and
+// max_tokens.
+func (m *Manager) AuthenticateInferenceKey(key string) (KeyPolicy, bool) {
 	if key == "" {
-		return false
+		return KeyPolicy{}, false
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	for _, k := range m.staticKeys {
 		if subtle.ConstantTimeCompare([]byte(k), []byte(key)) == 1 {
-			return true
+			return KeyPolicy{Static: true}, true
 		}
 	}
 
@@ -177,10 +233,14 @@ func (m *Manager) ValidateInferenceKey(key string) bool {
 		if err := bcrypt.CompareHashAndPassword([]byte(sk.Hash), []byte(key)); err == nil {
 			sk.LastUsed = time.Now()
 			_ = m.saveKeysLocked()
-			return true
+			return KeyPolicy{
+				ID:        sk.ID,
+				Models:    append([]string(nil), sk.Models...),
+				MaxTokens: sk.MaxTokens,
+			}, true
 		}
 	}
-	return false
+	return KeyPolicy{}, false
 }
 
 func (m *Manager) ListKeys() []PublicKey {
@@ -188,20 +248,21 @@ func (m *Manager) ListKeys() []PublicKey {
 	defer m.mu.RUnlock()
 	out := make([]PublicKey, 0, len(m.store.Keys))
 	for _, k := range m.store.Keys {
-		out = append(out, PublicKey{
-			ID:       k.ID,
-			Name:     k.Name,
-			Prefix:   k.Prefix,
-			Created:  k.Created,
-			LastUsed: k.LastUsed,
-			Revoked:  k.Revoked,
-		})
+		out = append(out, toPublicKey(k))
 	}
 	return out
 }
 
-func (m *Manager) CreateKey(name string) (PublicKey, string, error) {
+func (m *Manager) CreateKey(name string, limits KeyLimits) (PublicKey, string, error) {
 	name = trimName(name)
+	models, err := normalizeModels(limits.Models)
+	if err != nil {
+		return PublicKey{}, "", err
+	}
+	if limits.MaxTokens < 0 {
+		return PublicKey{}, "", fmt.Errorf("maxTokens must be >= 0")
+	}
+
 	secret, err := randomToken(32)
 	if err != nil {
 		return PublicKey{}, "", err
@@ -220,11 +281,13 @@ func (m *Manager) CreateKey(name string) (PublicKey, string, error) {
 	}
 
 	rec := storedKey{
-		ID:      id,
-		Name:    name,
-		Prefix:  prefix,
-		Hash:    string(hash),
-		Created: time.Now(),
+		ID:        id,
+		Name:      name,
+		Prefix:    prefix,
+		Hash:      string(hash),
+		Created:   time.Now(),
+		Models:    models,
+		MaxTokens: limits.MaxTokens,
 	}
 
 	m.mu.Lock()
@@ -236,7 +299,46 @@ func (m *Manager) CreateKey(name string) (PublicKey, string, error) {
 	}
 	m.mu.Unlock()
 
-	return PublicKey{ID: rec.ID, Name: rec.Name, Prefix: rec.Prefix, Created: rec.Created}, full, nil
+	return toPublicKey(rec), full, nil
+}
+
+// UpdateKey updates the name and/or limits of an existing key.
+func (m *Manager) UpdateKey(id string, name *string, limits *KeyLimits) (PublicKey, error) {
+	if id == "" {
+		return PublicKey{}, fmt.Errorf("key not found")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i := range m.store.Keys {
+		sk := &m.store.Keys[i]
+		if sk.ID != id {
+			continue
+		}
+		if sk.Revoked {
+			return PublicKey{}, fmt.Errorf("key is revoked")
+		}
+		if name != nil {
+			sk.Name = trimName(*name)
+		}
+		if limits != nil {
+			models, err := normalizeModels(limits.Models)
+			if err != nil {
+				return PublicKey{}, err
+			}
+			if limits.MaxTokens < 0 {
+				return PublicKey{}, fmt.Errorf("maxTokens must be >= 0")
+			}
+			sk.Models = models
+			sk.MaxTokens = limits.MaxTokens
+		}
+		if err := m.saveKeysLocked(); err != nil {
+			return PublicKey{}, err
+		}
+		return toPublicKey(*sk), nil
+	}
+	return PublicKey{}, fmt.Errorf("key not found")
 }
 
 func (m *Manager) RevokeKey(id string) error {
@@ -294,6 +396,39 @@ func (m *Manager) pruneSessionsLocked(now time.Time) {
 			delete(m.sessions, tok)
 		}
 	}
+}
+
+func toPublicKey(k storedKey) PublicKey {
+	return PublicKey{
+		ID:        k.ID,
+		Name:      k.Name,
+		Prefix:    k.Prefix,
+		Created:   k.Created,
+		LastUsed:  k.LastUsed,
+		Revoked:   k.Revoked,
+		Models:    append([]string(nil), k.Models...),
+		MaxTokens: k.MaxTokens,
+	}
+}
+
+func normalizeModels(models []string) ([]string, error) {
+	if len(models) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, m := range models {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			return nil, fmt.Errorf("models entries must be non-empty")
+		}
+		if _, ok := seen[m]; ok {
+			continue
+		}
+		seen[m] = struct{}{}
+		out = append(out, m)
+	}
+	return out, nil
 }
 
 func randomToken(n int) (string, error) {

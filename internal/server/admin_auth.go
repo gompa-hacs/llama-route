@@ -84,18 +84,75 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name string `json:"name"`
+		Name      string   `json:"name"`
+		Models    []string `json:"models"`
+		MaxTokens int64    `json:"maxTokens"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		shared.SendResponse(w, r, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	pub, secret, err := s.auth.CreateKey(req.Name)
+	pub, secret, err := s.auth.CreateKey(req.Name, auth.KeyLimits{
+		Models:    req.Models,
+		MaxTokens: req.MaxTokens,
+	})
 	if err != nil {
-		shared.SendResponse(w, r, http.StatusInternalServerError, err.Error())
+		shared.SendResponse(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"key": pub, "secret": secret})
+}
+
+func (s *Server) handleAdminUpdateKey(w http.ResponseWriter, r *http.Request) {
+	if s.auth == nil {
+		shared.SendResponse(w, r, http.StatusServiceUnavailable, "key management unavailable")
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		shared.SendResponse(w, r, http.StatusBadRequest, "missing key id")
+		return
+	}
+
+	var req struct {
+		Name      *string   `json:"name"`
+		Models    *[]string `json:"models"`
+		MaxTokens *int64    `json:"maxTokens"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		shared.SendResponse(w, r, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	var limits *auth.KeyLimits
+	if req.Models != nil || req.MaxTokens != nil {
+		limits = &auth.KeyLimits{}
+		// Start from current values so partial updates work.
+		for _, k := range s.auth.ListKeys() {
+			if k.ID == id {
+				limits.Models = append([]string(nil), k.Models...)
+				limits.MaxTokens = k.MaxTokens
+				break
+			}
+		}
+		if req.Models != nil {
+			limits.Models = *req.Models
+		}
+		if req.MaxTokens != nil {
+			limits.MaxTokens = *req.MaxTokens
+		}
+	}
+
+	pub, err := s.auth.UpdateKey(id, req.Name, limits)
+	if err != nil {
+		status := http.StatusBadRequest
+		if err.Error() == "key not found" {
+			status = http.StatusNotFound
+		}
+		shared.SendResponse(w, r, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"key": pub})
 }
 
 func (s *Server) handleAdminRevokeKey(w http.ResponseWriter, r *http.Request) {

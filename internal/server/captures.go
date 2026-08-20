@@ -64,7 +64,7 @@ var zstdEncOptions = []zstd.EOption{
 
 // zstdEncPool pools zstd.Encoder instances to reduce allocations.
 var zstdEncPool = &sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		enc, _ := zstd.NewWriter(nil, zstdEncOptions...)
 		return enc
 	},
@@ -72,7 +72,7 @@ var zstdEncPool = &sync.Pool{
 
 // zstdDecPool pools zstd.Decoder instances to reduce allocations.
 var zstdDecPool = &sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		dec, _ := zstd.NewReader(nil)
 		return dec
 	},

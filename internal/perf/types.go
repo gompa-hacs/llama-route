@@ -16,6 +16,8 @@ type GpuStat struct {
 	MemTotalMB  int     `json:"mem_total_mb"`
 	FanSpeedPct float64 `json:"fan_speed_pct"`
 	PowerDrawW  float64 `json:"power_draw_w"`
+	ClockMHz    int     `json:"clock_mhz"`
+	MemClockMHz int     `json:"mem_clock_mhz"`
 }
 
 type NetIOStat struct {

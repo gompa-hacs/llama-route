@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"strings"
@@ -143,9 +144,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 
 	if ctxData, ok := shared.ReadContext(r.Context()); ok && len(ctxData.Metadata) > 0 {
 		tm.Metadata = make(map[string]string, len(ctxData.Metadata))
-		for k, v := range ctxData.Metadata {
-			tm.Metadata[k] = v
-		}
+		maps.Copy(tm.Metadata, ctxData.Metadata)
 	}
 
 	queueAndEmit := func() {

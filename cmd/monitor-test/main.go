@@ -31,6 +31,9 @@ func printGpuStats(gpus []perf.GpuStat) {
 		fmt.Printf("  Util:  GPU %.1f%%  Mem %.1f%%\n", g.GpuUtilPct, g.MemUtilPct)
 		fmt.Printf("  Mem:   %d MB used / %d MB total\n", g.MemUsedMB, g.MemTotalMB)
 		fmt.Printf("  Temp:  %d°C   Fan: %.1f%%   Power: %.1f W\n", g.TempC, g.FanSpeedPct, g.PowerDrawW)
+		if g.ClockMHz > 0 || g.MemClockMHz > 0 {
+			fmt.Printf("  Clock: %d MHz core  %d MHz mem\n", g.ClockMHz, g.MemClockMHz)
+		}
 	}
 }
 

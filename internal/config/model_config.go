@@ -71,9 +71,16 @@ type ModelConfig struct {
 	Aliases       []string `yaml:"aliases"`
 	Env           []string `yaml:"env"`
 	CheckEndpoint string   `yaml:"checkEndpoint"`
-	UnloadAfter   int      `yaml:"ttl"`
-	Unlisted      bool     `yaml:"unlisted"`
-	UseModelName  string   `yaml:"useModelName"`
+	// Compat selects upstream protocol shims. "whisper" rewrites OpenAI
+	// transcription paths to whisper.cpp's default /inference.
+	Compat       string `yaml:"compat"`
+	UnloadAfter  int    `yaml:"ttl"`
+	Unlisted     bool   `yaml:"unlisted"`
+	UseModelName string `yaml:"useModelName"`
+
+	// WhisperCompat is set during config load when OpenAI→/inference rewrite
+	// should be applied for this model (non-pool).
+	WhisperCompat bool `yaml:"-"`
 
 	// #179 for /v1/models
 	Name        string `yaml:"name"`
@@ -116,7 +123,7 @@ func (m *ModelConfig) UsesPool() bool {
 	return m.Pool != nil && len(m.Pool.Backends) > 0
 }
 
-func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (m *ModelConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	type rawModelConfig ModelConfig
 	defaults := rawModelConfig{
 		Cmd:              "",
@@ -181,8 +188,8 @@ func (m *ModelConfig) ExtractContextSizeFromCmd() int {
 		}
 		// Also handle --ctx-size=32768 form
 		for _, prefix := range []string{"--ctx-size=", "--context=", "-c=", "-ctx="} {
-			if strings.HasPrefix(arg, prefix) {
-				if n, parseErr := strconv.Atoi(strings.TrimPrefix(arg, prefix)); parseErr == nil && n > 0 {
+			if after, ok := strings.CutPrefix(arg, prefix); ok {
+				if n, parseErr := strconv.Atoi(after); parseErr == nil && n > 0 {
 					return n
 				}
 			}
@@ -197,7 +204,7 @@ type ModelFilters struct {
 	Filters `yaml:",inline"`
 }
 
-func (m *ModelFilters) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (m *ModelFilters) UnmarshalYAML(unmarshal func(any) error) error {
 	type rawModelFilters ModelFilters
 	defaults := rawModelFilters{}
 

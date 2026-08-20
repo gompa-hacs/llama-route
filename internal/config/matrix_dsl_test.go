@@ -265,7 +265,7 @@ func TestDSL_ExpansionCap(t *testing.T) {
 	// Build an expression that would exceed 1000 combinations:
 	// (a1|a2|...|a32) & (b1|b2|...|b32) = 1024 combos
 	var aItems, bItems []string
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		aItems = append(aItems, fmt.Sprintf("a%d", i))
 		bItems = append(bItems, fmt.Sprintf("b%d", i))
 	}

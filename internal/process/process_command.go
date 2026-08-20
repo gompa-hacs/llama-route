@@ -3,8 +3,10 @@ package process
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -380,7 +382,7 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		return startResult{err: fmt.Errorf("invalid proxy URL %q: %w", p.config.Proxy, err)}
 	}
 
-	reverseProxy := httputil.NewSingleHostReverseProxy(proxyURL)
+	reverseProxy := shared.NewSingleHostReverseProxy(proxyURL, p.config.WhisperCompat)
 	reverseProxy.Transport = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -400,6 +402,18 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 			resp.Header.Set("X-Accel-Buffering", "no")
 		}
 		return nil
+	}
+	// Suppress stdlib ReverseProxy ErrorLog spam (e.g. connection refused while
+	// waiting for the upstream to become healthy). Route real errors through
+	// our logger instead.
+	reverseProxy.ErrorLog = log.New(io.Discard, "", 0)
+	reverseProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		if isProxyDialError(err) {
+			p.proxyLogger.Debugf("<%s> upstream not ready: %v", p.id, err)
+		} else {
+			p.proxyLogger.Warnf("<%s> proxy error: %v", p.id, err)
+		}
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
 	// httputil.ReverseProxy panics with http.ErrAbortHandler when the upstream
 	// disconnects after response headers have been sent. Recover here so the
@@ -731,6 +745,10 @@ func extractAndStoreContextLength(body []byte, p *ProcessCommand) {
 // the context length (default_generation_settings.n_ctx). Best-effort: failures
 // are silent and leave the stored value at 0.
 func (p *ProcessCommand) detectUpstreamContextLength(startCtx context.Context, reverseProxy *httputil.ReverseProxy) {
+	if p.config.WhisperCompat {
+		// whisper.cpp has no /props endpoint.
+		return
+	}
 	req, err := http.NewRequestWithContext(startCtx, http.MethodGet, "/props", nil)
 	if err != nil {
 		return
@@ -741,17 +759,34 @@ func (p *ProcessCommand) detectUpstreamContextLength(startCtx context.Context, r
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		p.proxyLogger.Infof("<%s> /props returned %d, skipping context detection", p.id, resp.StatusCode)
+		p.proxyLogger.Debugf("<%s> /props returned %d, skipping context detection", p.id, resp.StatusCode)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
-		p.proxyLogger.Infof("<%s> /props read error: %v", p.id, err)
+		p.proxyLogger.Debugf("<%s> /props read error: %v", p.id, err)
 		return
 	}
 
 	// Parse only the field we need to keep the dependency footprint small.
 	extractAndStoreContextLength(body, p)
+}
+
+// isProxyDialError reports connection failures expected while an upstream is
+// still starting (health-check retries).
+func isProxyDialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "network is unreachable")
 }
 
 func (p *ProcessCommand) State() ProcessState {

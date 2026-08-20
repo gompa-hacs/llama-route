@@ -30,12 +30,12 @@ func selectEncoding(acceptEncoding string) (encoding, ext string) {
 	if acceptEncoding == "" {
 		return "", ""
 	}
-	for _, part := range strings.Split(acceptEncoding, ",") {
+	for part := range strings.SplitSeq(acceptEncoding, ",") {
 		if strings.TrimSpace(strings.SplitN(part, ";", 2)[0]) == "br" {
 			return "br", ".br"
 		}
 	}
-	for _, part := range strings.Split(acceptEncoding, ",") {
+	for part := range strings.SplitSeq(acceptEncoding, ",") {
 		if strings.TrimSpace(strings.SplitN(part, ";", 2)[0]) == "gzip" {
 			return "gzip", ".gz"
 		}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -173,10 +174,8 @@ func resolveFilters(cfg config.Config, requested string) (useModelName string, f
 		return mc.UseModelName, mc.Filters.Filters, true
 	}
 	for _, peer := range cfg.Peers {
-		for _, m := range peer.Models {
-			if m == requested {
-				return "", peer.Filters, true
-			}
+		if slices.Contains(peer.Models, requested) {
+			return "", peer.Filters, true
 		}
 	}
 	return "", config.Filters{}, false

@@ -403,7 +403,7 @@ func TestFIFO_QueueCollation(t *testing.T) {
 	drain := func(model string, waiters int) {
 		eff.states[model] = process.StateReady
 		s.OnSwapDone(SwapDone{ModelID: model})
-		for i := 0; i < waiters; i++ {
+		for range waiters {
 			s.OnServeDone(ServeDoneEvent{ModelID: model})
 		}
 	}
@@ -715,7 +715,7 @@ func TestFIFO_ConcurrencyLimit_DefaultIsTen(t *testing.T) {
 	// nil models → every model gets defaultConcurrencyLimit (10).
 	s := newFIFO(&stubPlanner{}, eff)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		s.OnRequest(req("a"))
 	}
 	if got := eff.served("a"); got != 10 {

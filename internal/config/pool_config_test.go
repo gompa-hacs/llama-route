@@ -63,6 +63,76 @@ models:
 	if b[0].ProxyURL == nil || b[1].ProxyURL == nil {
 		t.Fatal("expected ProxyURL parsed")
 	}
+	if !b[0].WhisperCompat || !b[1].WhisperCompat {
+		t.Fatal("expected WhisperCompat for whisper-server backends")
+	}
+	if b[0].CheckEndpoint != "/" || b[1].CheckEndpoint != "/" {
+		t.Fatalf("expected checkEndpoint /, got %q %q", b[0].CheckEndpoint, b[1].CheckEndpoint)
+	}
+}
+
+func TestLoadConfig_WhisperCompatLocalModel(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  whisper:
+    cmd: whisper-server --port ${PORT} -m /models/w.bin
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := cfg.Models["whisper"]
+	if !m.WhisperCompat {
+		t.Fatal("expected WhisperCompat")
+	}
+	if m.CheckEndpoint != "/" {
+		t.Fatalf("checkEndpoint=%q, want /", m.CheckEndpoint)
+	}
+}
+
+func TestLoadConfig_WhisperRequestPathDisablesRewrite(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  whisper:
+    checkEndpoint: /v1/audio/transcriptions/
+    cmd: >
+      whisper-server --port ${PORT} -m /models/w.bin
+      --request-path /v1/audio/transcriptions --inference-path ""
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := cfg.Models["whisper"]
+	if m.WhisperCompat {
+		t.Fatal("WhisperCompat should be false when --request-path is set")
+	}
+	if m.CheckEndpoint != "/v1/audio/transcriptions/" {
+		t.Fatalf("checkEndpoint=%q", m.CheckEndpoint)
+	}
+}
+
+func TestLoadConfig_WhisperCompatStaticProxy(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  whisper:
+    compat: whisper
+    pool:
+      backends:
+        - proxy: http://127.0.0.1:9233
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := cfg.Models["whisper"].Pool.Backends[0]
+	if !b.WhisperCompat {
+		t.Fatal("expected WhisperCompat from model compat")
+	}
+	if b.CheckEndpoint != "/" {
+		t.Fatalf("checkEndpoint=%q, want /", b.CheckEndpoint)
+	}
+	rules := ResolveAffinityRules(cfg.Models["whisper"].Pool)
+	if len(rules) != 0 {
+		t.Fatalf("whisper pool should default to no sticky affinity, got %#v", rules)
+	}
 }
 
 func TestLoadConfig_PoolRejectsModelCmd(t *testing.T) {

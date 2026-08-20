@@ -389,12 +389,10 @@ func TestPeer_ServeHTTP_WaitsForInflightDuringShutdown(t *testing.T) {
 	*req = *req.WithContext(shared.SetContext(req.Context(), shared.ReqContextData{Model: "test-model", ModelID: "test-model"}))
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		w := httptest.NewRecorder()
 		pr.ServeHTTP(w, req)
-	}()
+	})
 
 	<-started
 
@@ -452,12 +450,10 @@ func TestPeer_ServeHTTP_ShutdownTimeoutCancelsInflight(t *testing.T) {
 	*req = *req.WithContext(shared.SetContext(req.Context(), shared.ReqContextData{Model: "test-model", ModelID: "test-model"}))
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		w := httptest.NewRecorder()
 		pr.ServeHTTP(w, req)
-	}()
+	})
 
 	<-started
 

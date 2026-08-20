@@ -434,7 +434,8 @@ models:
         - proxy: http://192.168.1.102:8080
         - proxy: http://192.168.1.103:8080
 
-  # Spawnable pool: one model name, N GPUs started by llama-swap
+  # Spawnable pool: one model name, N GPUs started by llama-swap.
+  # whisper-server is auto-detected: /v1/audio/transcriptions → /inference.
   "whisper-pooled":
     name: "Whisper (3 GPUs)"
     capabilities:

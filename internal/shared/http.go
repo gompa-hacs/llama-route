@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 
@@ -40,11 +41,8 @@ var (
 )
 
 func SendError(w http.ResponseWriter, r *http.Request, err error) {
-	var httpErr HTTPError
-	if errors.As(err, &httpErr) {
-		for k, v := range httpErr.Header() {
-			w.Header()[k] = v
-		}
+	if httpErr, ok := errors.AsType[HTTPError](err); ok {
+		maps.Copy(w.Header(), httpErr.Header())
 		w.WriteHeader(httpErr.StatusCode())
 		w.Write(httpErr.Body())
 		return

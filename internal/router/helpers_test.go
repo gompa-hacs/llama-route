@@ -199,7 +199,7 @@ func (f *fakeProcess) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 // per handlerReq or swapDone fully absorbed by run().
 func waitProcessed(t *testing.T, ch chan struct{}, n int) {
 	t.Helper()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		select {
 		case <-ch:
 		case <-time.After(2 * time.Second):

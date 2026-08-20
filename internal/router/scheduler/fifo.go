@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
@@ -459,12 +460,7 @@ func conflictsWithInFlight(evict []string, inFlight map[string]int) bool {
 }
 
 func containsString(xs []string, s string) bool {
-	for _, x := range xs {
-		if x == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(xs, s)
 }
 
 // broadcastQueuePositions sends each queued request its current 1-indexed

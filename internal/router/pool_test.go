@@ -87,6 +87,159 @@ func TestPool_StickyLeastInflight(t *testing.T) {
 	}
 }
 
+func TestPool_StickyYieldsWhenBusy(t *testing.T) {
+	var hits [2]atomic.Int32
+	block0 := make(chan struct{})
+	started0 := make(chan struct{})
+	srv0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits[0].Add(1)
+		select {
+		case <-started0:
+		default:
+			close(started0)
+		}
+		<-block0
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv0.Close()
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits[1].Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv1.Close()
+
+	u0, _ := url.Parse(srv0.URL)
+	u1, _ := url.Parse(srv1.URL)
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"pooled": {
+				Pool: &config.PoolConfig{
+					Backends: []config.PoolBackend{
+						{Proxy: srv0.URL, ProxyURL: u0},
+						{Proxy: srv1.URL, ProxyURL: u1},
+					},
+				},
+			},
+		},
+	}
+	pool, err := NewPool(cfg, logmon.NewWriter(io.Discard), logmon.NewWriter(io.Discard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Shutdown(0)
+
+	body := `{"model":"pooled","user":"alice"}`
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", io.NopCloser(strings.NewReader(body)))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		pool.ServeHTTP(w, r)
+	}()
+	<-started0
+
+	// Same sticky key while home is busy → overflow to idle backend.
+	r2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", io.NopCloser(strings.NewReader(body)))
+	r2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	pool.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("overflow status=%d body=%s", w2.Code, w2.Body.String())
+	}
+	if hits[1].Load() != 1 {
+		t.Fatalf("expected overflow to backend1, hits=%d/%d", hits[0].Load(), hits[1].Load())
+	}
+
+	close(block0)
+	<-done
+
+	// After home is idle again, sticky should return to backend0.
+	r3 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", io.NopCloser(strings.NewReader(body)))
+	r3.Header.Set("Content-Type", "application/json")
+	w3 := httptest.NewRecorder()
+	pool.ServeHTTP(w3, r3)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("return status=%d", w3.Code)
+	}
+	if hits[0].Load() != 2 {
+		t.Fatalf("expected sticky return to backend0, hits=%d/%d", hits[0].Load(), hits[1].Load())
+	}
+}
+
+func TestPool_WhisperSpreadsSameAPIKey(t *testing.T) {
+	var hits [2]atomic.Int32
+	block0 := make(chan struct{})
+	started0 := make(chan struct{})
+	srv0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits[0].Add(1)
+		close(started0)
+		<-block0
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv0.Close()
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits[1].Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv1.Close()
+
+	u0, _ := url.Parse(srv0.URL)
+	u1, _ := url.Parse(srv1.URL)
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"whisper": {
+				Pool: &config.PoolConfig{
+					Backends: []config.PoolBackend{
+						{Proxy: srv0.URL, ProxyURL: u0, WhisperCompat: true},
+						{Proxy: srv1.URL, ProxyURL: u1, WhisperCompat: true},
+					},
+				},
+			},
+		},
+	}
+	pool, err := NewPool(cfg, logmon.NewWriter(io.Discard), logmon.NewWriter(io.Discard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Shutdown(0)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", strings.NewReader("file=x&model=whisper"))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		r.Header.Set("Authorization", "Bearer sk-shared")
+		w := httptest.NewRecorder()
+		pool.ServeHTTP(w, r)
+	}()
+
+	<-started0
+
+	r2 := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", strings.NewReader("file=y&model=whisper"))
+	r2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r2.Header.Set("Authorization", "Bearer sk-shared")
+	w2 := httptest.NewRecorder()
+	pool.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second request status=%d body=%s", w2.Code, w2.Body.String())
+	}
+	if hits[1].Load() != 1 {
+		t.Fatalf("expected second request on idle backend1, hits=%d/%d", hits[0].Load(), hits[1].Load())
+	}
+
+	close(block0)
+	<-done
+}
+
+func TestExtractAffinityKey_EmptyRulesDisableSticky(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", strings.NewReader("model=w"))
+	r.Header.Set("Authorization", "Bearer sk-x")
+	if key := ExtractAffinityKey(r, []config.AffinityRule{}); key != "" {
+		t.Fatalf("empty rules should disable sticky, got %q", key)
+	}
+}
+
 func TestPool_Stats(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{})

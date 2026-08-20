@@ -130,6 +130,8 @@ func TestWriteGpuMetrics(t *testing.T) {
 			MemTotalMB:  24576,
 			FanSpeedPct: 55.0,
 			PowerDrawW:  300.5,
+			ClockMHz:    2100,
+			MemClockMHz: 10501,
 		},
 	}
 
@@ -144,6 +146,8 @@ func TestWriteGpuMetrics(t *testing.T) {
 	assert.Contains(t, body, `llamaswap_gpu_memory_total_bytes{id="0",name="NVIDIA RTX 4090",uuid="GPU-1234"}`)
 	assert.Contains(t, body, `llamaswap_gpu_fan_speed_percent{id="0",name="NVIDIA RTX 4090",uuid="GPU-1234"} 55`)
 	assert.Contains(t, body, `llamaswap_gpu_power_draw_watts{id="0",name="NVIDIA RTX 4090",uuid="GPU-1234"} 300.5`)
+	assert.Contains(t, body, `llamaswap_gpu_clock_mhz{id="0",name="NVIDIA RTX 4090",uuid="GPU-1234"} 2100`)
+	assert.Contains(t, body, `llamaswap_gpu_mem_clock_mhz{id="0",name="NVIDIA RTX 4090",uuid="GPU-1234"} 10501`)
 }
 
 func TestWriteGpuMetrics_VramTemp(t *testing.T) {

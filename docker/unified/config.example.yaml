@@ -10,13 +10,14 @@ models:
       --port ${PORT}
 
   "whisper":
-    checkEndpoint: /v1/audio/transcriptions/
+    # Stock whisper-server: llama-swap rewrites /v1/audio/transcriptions → /inference
+    # and defaults the health check to /. Optional: set compat: whisper for a
+    # static proxy backend that is not launched via cmd.
     cmd: >
       whisper-server
       --port ${PORT}
       --m /models/whisper.bin
       --flash-attn
-      --request-path /v1/audio/transcriptions --inference-path ""
 
   "image":
     checkEndpoint: /

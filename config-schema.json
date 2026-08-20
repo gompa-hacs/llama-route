@@ -312,6 +312,11 @@
                         "pattern": "^/.*$|^none$",
                         "description": "URL path to check if the server is ready. Use 'none' to skip health checking."
                     },
+                    "compat": {
+                        "type": "string",
+                        "enum": ["whisper"],
+                        "description": "Upstream protocol shim. 'whisper' rewrites OpenAI /v1/audio/transcriptions to whisper.cpp /inference (also auto-detected when cmd is whisper-server)."
+                    },
                     "ttl": {
                         "type": "integer",
                         "minimum": -1,

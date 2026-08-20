@@ -5,6 +5,8 @@
 // (e.g. auth failure, CORS preflight).
 package chain
 
+import "slices"
+
 import "net/http"
 
 // Middleware wraps an http.Handler with cross-cutting behavior. It receives
@@ -51,8 +53,8 @@ func (c Chain) Append(mws ...Middleware) Chain {
 // Then returns final unchanged.
 func (c Chain) Then(final http.Handler) http.Handler {
 	h := final
-	for i := len(c.mws) - 1; i >= 0; i-- {
-		h = c.mws[i](h)
+	for _, v := range slices.Backward(c.mws) {
+		h = v(h)
 	}
 	return h
 }

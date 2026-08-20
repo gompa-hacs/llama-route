@@ -70,6 +70,14 @@ models:
 - `proxy` defaults to `http://127.0.0.1:${PORT}` when omitted
 - Do **not** set model-level `cmd` together with `pool`
 - Mix static `proxy:` and spawn `cmd:` backends in the same pool if needed
+- **whisper.cpp:** when `cmd` launches `whisper-server` (or `compat: whisper` is set),
+  llama-swap rewrites `POST /v1/audio/transcriptions` → `/inference` and defaults
+  health checks to `/`. Native `POST /inference` is left unchanged. If `cmd` already
+  includes `--request-path`, rewriting is skipped.
+- **whisper.cpp pools** disable sticky affinity by default (so concurrent transcriptions
+  spread across GPUs). LLM pools still stick by session/API key. Override with an
+  explicit `pool.affinity` list if needed. Set `affinityTTL: 0s` to disable sticky
+  mappings on any pool.
 
 ### Full pool options
 
@@ -100,8 +108,8 @@ models:
 
 | Field | Default | Description |
 | ----- | ------- | ----------- |
-| `strategy` | `sticky_least_inflight` | Assign new sessions to the least-busy backend; stick follow-ups to that backend. |
-| `affinityTTL` | `30m` | Idle time before an affinity mapping expires. |
+| `strategy` | `sticky_least_inflight` | Stick to a home backend when it is **idle**; if that slot is busy, overflow to the least in-flight backend (affinity mapping stays on the home slot). |
+| `affinityTTL` | `30m` | Idle time before an affinity mapping expires. `0s` disables sticky mappings. |
 | `start` | `on_demand` | When to launch spawn backends: `on_demand` or `preload`. |
 | `restartOnCrash` | `true` | Restart spawn backends that exit unexpectedly. |
 | `backends` | *(required)* | List of upstreams (`proxy` and/or `cmd`). |
@@ -126,10 +134,12 @@ Client request for model "llama-70b"
         ▼
   Extract affinity key from request
         │
-        ├─ Key known ──► use mapped backend (refresh TTL)
+        ├─ Key known, home backend idle ──► use home backend (refresh TTL)
         │
-        └─ Key unknown ──► pick backend with lowest in-flight count
-                           (store mapping if a key was found)
+        ├─ Key known, home backend busy ──► pick least in-flight elsewhere
+        │                                   (keep home mapping for later)
+        │
+        └─ Key unknown ──► pick least in-flight; store mapping if a key was found
         │
         ▼
   Reverse proxy to chosen backend
@@ -244,10 +254,26 @@ Create keys from the web UI: **API Keys** tab (`/ui/#/keys`), or via API:
 # After logging in (session cookie):
 curl -X POST http://localhost:8080/api/admin/keys \
   -H 'Content-Type: application/json' \
-  -d '{"name":"my-client"}' \
+  -d '{"name":"my-client","models":["llama-70b"],"maxTokens":4096}' \
   --cookie 'llama-swap-session=...'
 
 # Response includes "secret" once — store it immediately.
+```
+
+Optional limits on UI-managed keys:
+
+| Field | Meaning |
+| ----- | ------- |
+| `models` | Allow-list of model IDs/aliases. Empty or omitted = all models. |
+| `maxTokens` | Cap on request `max_tokens` / `max_completion_tokens`. `0` = unlimited. |
+
+Update limits later with `PATCH /api/admin/keys/{id}`:
+
+```bash
+curl -X PATCH http://localhost:8080/api/admin/keys/{id} \
+  -H 'Content-Type: application/json' \
+  -d '{"models":["llama-70b","whisper"],"maxTokens":2048}' \
+  --cookie 'llama-swap-session=...'
 ```
 
 Revoke:
@@ -257,7 +283,7 @@ curl -X DELETE http://localhost:8080/api/admin/keys/{id} \
   --cookie 'llama-swap-session=...'
 ```
 
-UI-managed keys are prefixed with `sk-ls-`.
+UI-managed keys are prefixed with `sk-ls-`. Static `apiKeys` from YAML remain unrestricted.
 
 ### Auth behaviour matrix
 
@@ -290,7 +316,8 @@ inference auth is enabled (`apiKeys` and/or UI-managed keys exist):
 | `POST` | `/api/auth/login` | Public | Body: `{ "password": "…" }` — sets session cookie |
 | `POST` | `/api/auth/logout` | Public | Clears session cookie |
 | `GET` | `/api/admin/keys` | Dashboard | List keys (no secrets) |
-| `POST` | `/api/admin/keys` | Dashboard | Create key; returns `secret` once |
+| `POST` | `/api/admin/keys` | Dashboard | Create key; returns `secret` once. Body may include `models` and `maxTokens`. |
+| `PATCH` | `/api/admin/keys/{id}` | Dashboard | Update name / `models` / `maxTokens` |
 | `DELETE` | `/api/admin/keys/{id}` | Dashboard | Revoke key |
 
 ---

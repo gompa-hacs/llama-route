@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/shared"
@@ -53,6 +54,60 @@ func TestServer_HandleListModels(t *testing.T) {
 	if ids["hidden"] {
 		t.Error("unlisted model should not appear")
 	}
+}
+
+func TestServer_HandleListModels_FilteredByAPIKey(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"llama-70b": {Name: "Llama"},
+			"whisper":   {Name: "Whisper"},
+		},
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {Models: []string{"remote-model"}},
+		},
+		Admin: config.AdminConfig{KeysFile: dir + "/keys.json"},
+	}
+	mgr, err := auth.NewManager(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secret, err := mgr.CreateKey("client", auth.KeyLimits{Models: []string{"llama-70b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = cfg
+	s.auth = mgr
+	s.routes() // rebuild mux so inference auth sees the new key manager
+
+	t.Run("restricted key sees only allowed models", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer "+secret)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Data []modelRecord `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Data) != 1 || resp.Data[0].ID != "llama-70b" {
+			t.Fatalf("got %#v, want only llama-70b", resp.Data)
+		}
+	})
+
+	t.Run("missing key is unauthorized when keys exist", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", w.Code)
+		}
+	})
 }
 
 func TestServer_HandleListModels_Aliases(t *testing.T) {

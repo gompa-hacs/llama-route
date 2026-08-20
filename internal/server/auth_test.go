@@ -8,6 +8,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
 func TestServer_SanitizeAccessControlRequestHeaders(t *testing.T) {
@@ -123,6 +124,74 @@ func TestServer_AuthMiddleware(t *testing.T) {
 			t.Error("missing WWW-Authenticate header")
 		}
 	})
+}
+
+func TestServer_KeyLimitsMiddleware(t *testing.T) {
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			"llama-70b": {},
+			"whisper":   {},
+		},
+	}
+	final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mw := CreateKeyLimitsMiddleware(cfg)
+
+	withPolicy := func(body string, policy auth.KeyPolicy) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		r = r.WithContext(auth.ContextWithKeyPolicy(r.Context(), policy))
+		// Seed request context as CreateRequestContextMiddleware would.
+		if _, err := shared.FetchContext(r, cfg); err != nil {
+			t.Fatalf("FetchContext: %v", err)
+		}
+		w := httptest.NewRecorder()
+		mw(final).ServeHTTP(w, r)
+		return w
+	}
+
+	t.Run("allowed model passes", func(t *testing.T) {
+		w := withPolicy(`{"model":"llama-70b","max_tokens":100}`, auth.KeyPolicy{
+			Models:    []string{"llama-70b"},
+			MaxTokens: 2048,
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("disallowed model forbidden", func(t *testing.T) {
+		w := withPolicy(`{"model":"whisper"}`, auth.KeyPolicy{Models: []string{"llama-70b"}})
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", w.Code)
+		}
+	})
+
+	t.Run("max_tokens over limit forbidden", func(t *testing.T) {
+		w := withPolicy(`{"model":"llama-70b","max_tokens":9000}`, auth.KeyPolicy{MaxTokens: 2048})
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403 body=%s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("max_completion_tokens over limit forbidden", func(t *testing.T) {
+		w := withPolicy(`{"model":"llama-70b","max_completion_tokens":5000}`, auth.KeyPolicy{MaxTokens: 100})
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", w.Code)
+		}
+	})
+}
+
+func TestServer_RequestedTokensExceed(t *testing.T) {
+	ok, field, n := requestedTokensExceed([]byte(`{"max_tokens":100}`), 50)
+	if !ok || field != "max_tokens" || n != 100 {
+		t.Fatalf("got %v %q %d", ok, field, n)
+	}
+	ok, _, _ = requestedTokensExceed([]byte(`{"max_tokens":50}`), 50)
+	if ok {
+		t.Fatal("equal should not exceed")
+	}
 }
 
 func TestServer_AdminAuthMiddleware_SessionOnly(t *testing.T) {

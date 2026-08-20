@@ -225,7 +225,7 @@ func TestProcessCommand_StopReapsForkedGrandchild(t *testing.T) {
 		t.Fatalf("FindProcess: %v", err)
 	}
 	gone := false
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if err := proc.Signal(syscall.Signal(0)); err != nil {
 			gone = true
 			break

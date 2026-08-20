@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,22 +98,13 @@ var modelGetRoutes = []string{
 // isMetricsRecordPath reports whether path is one of the model-dispatched
 // endpoints that the metrics middleware records in the activity log.
 func isMetricsRecordPath(path string) bool {
-	for _, p := range modelPostJSONRoutes {
-		if p == path {
-			return true
-		}
+	if slices.Contains(modelPostJSONRoutes, path) {
+		return true
 	}
-	for _, p := range modelPostFormRoutes {
-		if p == path {
-			return true
-		}
+	if slices.Contains(modelPostFormRoutes, path) {
+		return true
 	}
-	for _, p := range modelGetRoutes {
-		if p == path {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(modelGetRoutes, path)
 }
 
 // BuildInfo carries version metadata surfaced by GET /api/version.
@@ -221,6 +213,7 @@ func (s *Server) routes() {
 	modelChain := chain.New(
 		inferenceAuth,
 		CreateRequestContextMiddleware(s.cfg),
+		CreateKeyLimitsMiddleware(s.cfg),
 		CreateStripClientAuthMiddleware(),
 		CreateFilterMiddleware(s.cfg),
 		CreateFormFilterMiddleware(s.cfg),
@@ -284,6 +277,7 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/captures/{id}", dashboardChain.ThenFunc(s.handleAPICapture))
 	mux.Handle("GET /api/admin/keys", dashboardChain.ThenFunc(s.handleAdminListKeys))
 	mux.Handle("POST /api/admin/keys", dashboardChain.ThenFunc(s.handleAdminCreateKey))
+	mux.Handle("PATCH /api/admin/keys/{id}", dashboardChain.ThenFunc(s.handleAdminUpdateKey))
 	mux.Handle("DELETE /api/admin/keys/{id}", dashboardChain.ThenFunc(s.handleAdminRevokeKey))
 
 	s.mux = mux

@@ -11,7 +11,7 @@ import (
 )
 
 // ParseNvidiaSmiLine parses a single line from nvidia-smi CSV output.
-// Format: index,name,uuid,temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed,power.draw
+// Format: index,name,uuid,temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed,power.draw[,clocks.current.graphics,clocks.current.memory]
 func ParseNvidiaSmiLine(line string) *GpuStat {
 	fields := strings.Split(line, ",")
 	if len(fields) < 9 {
@@ -27,6 +27,12 @@ func ParseNvidiaSmiLine(line string) *GpuStat {
 	memTotal, _ := strconv.Atoi(strings.TrimSpace(fields[6]))
 	fanSpeed, _ := strconv.ParseFloat(strings.TrimSpace(fields[7]), 64)
 	powerDraw, _ := strconv.ParseFloat(strings.TrimSpace(fields[8]), 64)
+
+	var clockMHz, memClockMHz int
+	if len(fields) >= 11 {
+		clockMHz, _ = strconv.Atoi(strings.TrimSpace(fields[9]))
+		memClockMHz, _ = strconv.Atoi(strings.TrimSpace(fields[10]))
+	}
 
 	var memUtil float64
 	if memTotal > 0 {
@@ -45,6 +51,8 @@ func ParseNvidiaSmiLine(line string) *GpuStat {
 		MemTotalMB:  memTotal,
 		FanSpeedPct: fanSpeed,
 		PowerDrawW:  powerDraw,
+		ClockMHz:    clockMHz,
+		MemClockMHz: memClockMHz,
 	}
 }
 
@@ -210,5 +218,6 @@ func ParseMactopLine(line string) *GpuStat {
 		MemTotalMB:  memTotalMB,
 		FanSpeedPct: fanSpeed,
 		PowerDrawW:  out.SocMetrics.GPUPower,
+		ClockMHz:    out.SocMetrics.GPUFreq,
 	}
 }

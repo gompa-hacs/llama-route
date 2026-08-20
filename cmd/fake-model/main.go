@@ -241,7 +241,7 @@ func chatHandler(ready <-chan struct{}) http.HandlerFunc {
 		defer ticker.Stop()
 
 		stop := "stop"
-		for i := 0; i < tokens; i++ {
+		for i := range tokens {
 			select {
 			case <-ctx.Done():
 				return

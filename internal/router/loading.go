@@ -174,10 +174,7 @@ func (s *loadingWriter) sendInline(text string) {
 		default:
 		}
 
-		end := i + chunkSize
-		if end > len(runes) {
-			end = len(runes)
-		}
+		end := min(i+chunkSize, len(runes))
 		chunk := string(runes[i:end])
 		s.sendData(chunk)
 		i = end

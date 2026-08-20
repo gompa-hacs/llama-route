@@ -11,7 +11,7 @@ type PerformanceConfig struct {
 	Every    time.Duration `yaml:"every"`
 }
 
-func (p *PerformanceConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (p *PerformanceConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	type rawPerformanceConfig PerformanceConfig
 	defaults := rawPerformanceConfig{
 		Every: 5 * time.Second,

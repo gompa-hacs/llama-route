@@ -12,8 +12,10 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/logmon"
@@ -31,28 +33,108 @@ func getGpuStats(ctx context.Context, every time.Duration, logger *logmon.Monito
 		logger.Debugf("LACT: %s", err.Error())
 	}
 
+	// nvidia-smi and amdgpu (sysfs/rocm-smi) are independent. On hybrid
+	// systems both must run or the first successful backend hides the other.
+	var sources []chan []GpuStat
+	var names []string
+
 	if ch, err := tryNvidiaSmi(ctx, every, logger); err == nil {
-		logger.Info("using nvidia-smi for GPU monitoring")
-		return ch, nil
+		sources = append(sources, ch)
+		names = append(names, "nvidia-smi")
 	} else {
 		logger.Debugf("nvidia-smi: %s", err.Error())
 	}
 
-	if ch, err := tryRocmSmi(ctx, every, logger); err == nil {
-		logger.Info("using rocm-smi for GPU monitoring")
-		return ch, nil
-	} else {
-		logger.Debugf("rocm-smi: %s", err.Error())
-	}
-
 	if ch, err := trySysfs(ctx, every, logger); err == nil {
-		logger.Info("using sysfs for GPU monitoring")
-		return ch, nil
+		sources = append(sources, ch)
+		names = append(names, "sysfs")
 	} else {
 		logger.Debugf("sysfs: %s", err.Error())
+		if ch, err := tryRocmSmi(ctx, every, logger); err == nil {
+			sources = append(sources, ch)
+			names = append(names, "rocm-smi")
+		} else {
+			logger.Debugf("rocm-smi: %s", err.Error())
+		}
 	}
 
-	return nil, ErrNoGpuTool
+	switch len(sources) {
+	case 0:
+		return nil, ErrNoGpuTool
+	case 1:
+		logger.Infof("using %s for GPU monitoring", names[0])
+		return sources[0], nil
+	default:
+		logger.Infof("using %s for GPU monitoring", strings.Join(names, "+"))
+		return mergeGpuStatChannels(ctx, sources...), nil
+	}
+}
+
+// mergeGpuStatChannels combines snapshots from multiple GPU backends, keeping
+// the latest sample per device (keyed by UUID, falling back to source+id).
+// The output channel stays open until ctx is cancelled, even if one backend dies.
+func mergeGpuStatChannels(ctx context.Context, sources ...chan []GpuStat) chan []GpuStat {
+	out := make(chan []GpuStat, 1)
+	latest := make(map[string]GpuStat)
+	var mu sync.Mutex
+
+	emit := func() {
+		mu.Lock()
+		stats := make([]GpuStat, 0, len(latest))
+		for _, s := range latest {
+			stats = append(stats, s)
+		}
+		mu.Unlock()
+		if len(stats) == 0 {
+			return
+		}
+		sort.Slice(stats, func(i, j int) bool {
+			if stats[i].ID != stats[j].ID {
+				return stats[i].ID < stats[j].ID
+			}
+			return stats[i].UUID < stats[j].UUID
+		})
+		select {
+		case out <- stats:
+		default:
+		}
+	}
+
+	var wg sync.WaitGroup
+	for i, ch := range sources {
+		wg.Add(1)
+		go func(src int, ch chan []GpuStat) {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case stats, ok := <-ch:
+					if !ok {
+						return
+					}
+					mu.Lock()
+					for _, s := range stats {
+						key := s.UUID
+						if key == "" {
+							key = fmt.Sprintf("src%d-%d", src, s.ID)
+						}
+						latest[key] = s
+					}
+					mu.Unlock()
+					emit()
+				}
+			}
+		}(i, ch)
+	}
+
+	go func() {
+		<-ctx.Done()
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
 }
 
 func tryLACT(ctx context.Context, every time.Duration, logger *logmon.Monitor) (chan []GpuStat, error) {
@@ -65,17 +147,37 @@ func tryLACT(ctx context.Context, every time.Duration, logger *logmon.Monitor) (
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to LACT socket: %w", err)
 	}
-	defer conn.Close()
 
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	devices, err := lactListDevices(conn)
 	if err != nil {
+		conn.Close()
 		return nil, fmt.Errorf("LACT ListDevices failed: %w", err)
 	}
 
 	if len(devices) == 0 {
+		conn.Close()
 		return nil, fmt.Errorf("LACT returned no devices")
+	}
+
+	// Probe once for usable stats so an empty/broken LACT daemon does not
+	// block nvidia-smi / sysfs / rocm-smi fallbacks.
+	probeStats := make([]GpuStat, 0, len(devices))
+	for i, d := range devices {
+		stat, err := lactGetDeviceStats(conn, d.ID, d.Name, i)
+		if err != nil {
+			continue
+		}
+		if stat.MemTotalMB == 0 {
+			continue
+		}
+		probeStats = append(probeStats, stat)
+	}
+	conn.Close()
+
+	if len(probeStats) == 0 {
+		return nil, fmt.Errorf("LACT returned no usable device stats")
 	}
 
 	ch := make(chan []GpuStat, 1)
@@ -84,6 +186,11 @@ func tryLACT(ctx context.Context, every time.Duration, logger *logmon.Monitor) (
 		defer close(ch)
 		ticker := time.NewTicker(every)
 		defer ticker.Stop()
+
+		select {
+		case ch <- probeStats:
+		default:
+		}
 
 		for {
 			select {
@@ -138,47 +245,70 @@ func tryNvidiaSmi(ctx context.Context, every time.Duration, logger *logmon.Monit
 		return nil, ErrNoGpuTool
 	}
 
-	sec := int(every.Seconds())
-	if sec < 1 {
-		sec = 1
+	// Probe once so a present-but-broken nvidia-smi does not block AMD fallbacks.
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	probe := exec.CommandContext(probeCtx, "nvidia-smi", "-L")
+	out, err := probe.Output()
+	if err != nil || !strings.Contains(string(out), "GPU ") {
+		return nil, ErrNoGpuTool
 	}
 
-	cmd := exec.CommandContext(ctx, "nvidia-smi",
-		"--query-gpu=index,name,uuid,temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed,power.draw",
-		"--format=csv,noheader,nounits",
-		"--loop", fmt.Sprintf("%d", sec),
-	)
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("nvidia-smi stdout pipe failed: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("nvidia-smi start failed: %w", err)
-	}
-
+	sec := max(int(every.Seconds()), 1)
 	ch := make(chan []GpuStat, 1)
 
 	go func() {
 		defer close(ch)
 
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
+		for {
+			if ctx.Err() != nil {
+				return
 			}
 
-			stat := ParseNvidiaSmiLine(line)
-			if stat != nil {
-				select {
-				case ch <- []GpuStat{*stat}:
-				default:
+			cmd := exec.CommandContext(ctx, "nvidia-smi",
+				"--query-gpu=index,name,uuid,temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed,power.draw,clocks.current.graphics,clocks.current.memory",
+				"--format=csv,noheader,nounits",
+				"--loop", fmt.Sprintf("%d", sec),
+			)
+
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				logger.Debugf("nvidia-smi stdout pipe failed: %s", err.Error())
+				return
+			}
+
+			if err := cmd.Start(); err != nil {
+				logger.Debugf("nvidia-smi start failed: %s", err.Error())
+				return
+			}
+
+			scanner := bufio.NewScanner(stdout)
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				if line == "" {
+					continue
+				}
+
+				stat := ParseNvidiaSmiLine(line)
+				if stat != nil {
+					select {
+					case ch <- []GpuStat{*stat}:
+					default:
+					}
 				}
 			}
+			_ = cmd.Wait()
+
+			if ctx.Err() != nil {
+				return
+			}
+			logger.Debug("nvidia-smi exited, restarting")
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
 		}
-		cmd.Wait()
 	}()
 
 	return ch, nil
@@ -193,6 +323,12 @@ func tryRocmSmi(ctx context.Context, every time.Duration, logger *logmon.Monitor
 	}
 	const pollTimeout = 5 * time.Second
 
+	probeCtx, cancel := context.WithTimeout(ctx, pollTimeout)
+	defer cancel()
+	if len(sampleRocmSmi(probeCtx, logger)) == 0 {
+		return nil, ErrNoGpuTool
+	}
+
 	ch := make(chan []GpuStat, 1)
 
 	go func() {
@@ -206,35 +342,8 @@ func tryRocmSmi(ctx context.Context, every time.Duration, logger *logmon.Monitor
 				return
 			case <-ticker.C:
 				pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
-				cmd := exec.CommandContext(pollCtx, "rocm-smi", "-i", "-P", "-t", "-f", "-u", "--showmemuse", "--showmeminfo", "vram", "--showproductname", "--csv")
-				out, err := cmd.Output()
-				timedOut := pollCtx.Err() == context.DeadlineExceeded
+				stats := sampleRocmSmi(pollCtx, logger)
 				cancel()
-				if err != nil {
-					if timedOut {
-						logger.Debug("rocm-smi timed out")
-					}
-					continue
-				}
-
-				stats := make([]GpuStat, 0)
-				scanner := bufio.NewScanner(strings.NewReader(string(out)))
-				var header string
-				for scanner.Scan() {
-					line := strings.TrimSpace(scanner.Text())
-					if line == "" {
-						continue
-					}
-					if strings.HasPrefix(line, "device,") {
-						header = line
-						continue
-					}
-
-					stat := parseRocmSmiLine(header, line)
-					if stat != nil {
-						stats = append(stats, *stat)
-					}
-				}
 
 				if len(stats) > 0 {
 					select {
@@ -247,6 +356,37 @@ func tryRocmSmi(ctx context.Context, every time.Duration, logger *logmon.Monitor
 	}()
 
 	return ch, nil
+}
+
+func sampleRocmSmi(ctx context.Context, logger *logmon.Monitor) []GpuStat {
+	cmd := exec.CommandContext(ctx, "rocm-smi", "-i", "-P", "-t", "-f", "-u", "--showmemuse", "--showmeminfo", "vram", "--showproductname", "--csv")
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			logger.Debug("rocm-smi timed out")
+		}
+		return nil
+	}
+
+	stats := make([]GpuStat, 0)
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	var header string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "device,") {
+			header = line
+			continue
+		}
+
+		stat := parseRocmSmiLine(header, line)
+		if stat != nil {
+			stats = append(stats, *stat)
+		}
+	}
+	return stats
 }
 
 func parseRocmSmiLine(header string, line string) *GpuStat {
@@ -333,10 +473,6 @@ func parseRocmSmiLine(header string, line string) *GpuStat {
 	return result
 }
 
-func trySysfs(ctx context.Context, every time.Duration, logger *logmon.Monitor) (chan []GpuStat, error) {
-	return nil, ErrNotImplemented
-}
-
 func lactSocketPath() string {
 	if p := os.Getenv("LACT_DAEMON_SOCKET_PATH"); p != "" {
 		if _, err := os.Stat(p); err == nil {
@@ -362,8 +498,8 @@ func lactSocketPath() string {
 }
 
 type lactRequest struct {
-	Command string      `json:"command"`
-	Args    interface{} `json:"args,omitempty"`
+	Command string `json:"command"`
+	Args    any    `json:"args,omitempty"`
 }
 
 type lactResponse struct {
@@ -522,10 +658,6 @@ func lactGetDeviceStats(conn net.Conn, id string, name string, index int) (GpuSt
 		FanSpeedPct: fanSpeed,
 		PowerDrawW:  powerDraw,
 	}, nil
-}
-
-func readSysfs() ([]GpuStat, error) {
-	return nil, ErrNotImplemented
 }
 
 func readSysStats() (SysStat, error) {

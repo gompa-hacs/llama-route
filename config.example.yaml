@@ -386,7 +386,7 @@ models:
       #   - header: X-Conversation-Id
       #   - apiKey: true
 
-  # Spawnable pool: llama-swap starts one process per GPU and load-balances
+  # Spawnable pool: stock whisper-server per GPU (OpenAI path rewritten automatically)
   # "whisper-pooled":
   #   capabilities:
   #     in: [audio]

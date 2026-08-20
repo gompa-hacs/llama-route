@@ -178,24 +178,12 @@ func (m *model) relayout() {
 	if m.width < minPanelWidth+4 {
 		m.cols = 1
 	} else {
-		m.cols = m.width / (minPanelWidth + 2)
-		if m.cols > maxCols {
-			m.cols = maxCols
-		}
-		if m.cols > len(m.panels) {
-			m.cols = len(m.panels)
-		}
-		if m.cols < 1 {
-			m.cols = 1
-		}
+		m.cols = max(min(min(m.width/(minPanelWidth+2), maxCols), len(m.panels)), 1)
 	}
 
 	// inner content width: total width / cols, minus borders+padding (4) and gap.
 	boxOuter := m.width/m.cols - 1
-	m.pw = boxOuter - 4
-	if m.pw < 8 {
-		m.pw = 8
-	}
+	m.pw = max(boxOuter-4, 8)
 
 	m.vp = viewport.New(m.pw, panelHeight-2)
 	m.ready = true

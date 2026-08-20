@@ -155,26 +155,21 @@ func (p *Pool) newPoolModel(modelID string, mc config.ModelConfig) (*poolModel, 
 	pm := &poolModel{
 		modelID:      modelID,
 		cfg:          mc,
-		rules:        poolCfg.EffectiveAffinityRules(),
+		rules:        config.ResolveAffinityRules(poolCfg),
 		ttl:          poolCfg.AffinityDuration(),
 		startMode:    poolCfg.StartMode(),
-		backends:     make([]poolBackend, 0, n),
+		backends:     make([]poolBackend, n),
 		contextSizes: make([]atomic.Int64, n),
 		inflight:     make([]int, n),
 		affinity:     make(map[string]affinityEntry),
 	}
 
-	healthTimeout := time.Duration(mc.HealthCheckTimeout) * time.Second
-	if healthTimeout < 15*time.Second {
-		healthTimeout = 15 * time.Second
-	}
+	healthTimeout := max(time.Duration(mc.HealthCheckTimeout)*time.Second, 15*time.Second)
 
 	for i, b := range poolCfg.Backends {
-		backend, err := p.buildBackend(modelID, mc, i, b, healthTimeout)
-		if err != nil {
+		if err := p.buildBackend(modelID, mc, i, b, healthTimeout, &pm.backends[i]); err != nil {
 			return nil, err
 		}
-		pm.backends = append(pm.backends, backend)
 		pm.backends[i].model = pm
 		if b.ContextSize > 0 {
 			pm.contextSizes[i].Store(int64(b.ContextSize))
@@ -184,8 +179,8 @@ func (p *Pool) newPoolModel(modelID string, mc config.ModelConfig) (*poolModel, 
 	return pm, nil
 }
 
-func (p *Pool) buildBackend(modelID string, mc config.ModelConfig, i int, b config.PoolBackend, healthTimeout time.Duration) (poolBackend, error) {
-	backend := poolBackend{
+func (p *Pool) buildBackend(modelID string, mc config.ModelConfig, i int, b config.PoolBackend, healthTimeout time.Duration, backend *poolBackend) error {
+	*backend = poolBackend{
 		id:             i,
 		proxy:          b.Proxy,
 		restartOnCrash: mc.Pool.ShouldRestartOnCrash(),
@@ -215,17 +210,18 @@ func (p *Pool) buildBackend(modelID string, mc config.ModelConfig, i int, b conf
 			UnloadAfter:        0, // pool sidecars stay warm
 			Timeouts:           mc.Timeouts,
 			HealthCheckTimeout: mc.HealthCheckTimeout,
+			WhisperCompat:      b.WhisperCompat,
 		}
 		procLog := logmon.NewWriter(p.upstreamlog)
 		proc, err := process.New(p.procCtx, procID, synth, procLog, p.logger)
 		if err != nil {
-			return poolBackend{}, fmt.Errorf("model %s backend %d: creating process: %w", modelID, i, err)
+			return fmt.Errorf("model %s backend %d: creating process: %w", modelID, i, err)
 		}
 		backend.proc = proc
 		backend.procID = procID
 		// Spawn backends start unhealthy until WaitReady succeeds.
 		backend.healthy.Store(false)
-		return backend, nil
+		return nil
 	}
 
 	transport := &http.Transport{
@@ -244,7 +240,7 @@ func (p *Pool) buildBackend(modelID string, mc config.ModelConfig, i int, b conf
 	}
 
 	target := b.ProxyURL
-	rp := httputil.NewSingleHostReverseProxy(target)
+	rp := shared.NewSingleHostReverseProxy(target, b.WhisperCompat)
 	rp.Transport = transport
 	rp.ModifyResponse = func(resp *http.Response) error {
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
@@ -261,7 +257,7 @@ func (p *Pool) buildBackend(modelID string, mc config.ModelConfig, i int, b conf
 		http.Error(w, msg, http.StatusBadGateway)
 	}
 	backend.reverseProxy = rp
-	return backend, nil
+	return nil
 }
 
 func (b *poolBackend) kickSupervise(p *Pool) {
@@ -464,6 +460,11 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 // pickAndTrack selects an eligible backend and increments its inflight counter.
+//
+// Sticky affinity is honored only when the mapped backend is idle (zero
+// in-flight). If that "home" slot is busy, the request is load-balanced to
+// another backend without moving the affinity mapping, so later requests
+// prefer the home slot again once it is free.
 func (pm *poolModel) pickAndTrack(affinityKey string, reqNctx int) (int, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -474,11 +475,17 @@ func (pm *poolModel) pickAndTrack(affinityKey string, reqNctx int) (int, error) 
 	if affinityKey != "" {
 		if entry, ok := pm.affinity[affinityKey]; ok && entry.backendID >= 0 && entry.backendID < len(pm.backends) {
 			if pm.isRoutableLocked(entry.backendID, reqNctx) {
-				pm.affinity[affinityKey] = affinityEntry{backendID: entry.backendID, expires: now.Add(pm.ttl)}
-				pm.inflight[entry.backendID]++
-				return entry.backendID, nil
+				if pm.ttl > 0 {
+					pm.affinity[affinityKey] = affinityEntry{backendID: entry.backendID, expires: now.Add(pm.ttl)}
+				}
+				if pm.inflight[entry.backendID] == 0 {
+					pm.inflight[entry.backendID]++
+					return entry.backendID, nil
+				}
+				// Home is busy — keep the mapping and fall through to least-inflight.
+			} else {
+				delete(pm.affinity, affinityKey)
 			}
-			delete(pm.affinity, affinityKey)
 		}
 	}
 
@@ -499,8 +506,12 @@ func (pm *poolModel) pickAndTrack(affinityKey string, reqNctx int) (int, error) 
 		return -1, fmt.Errorf("pool %s: no eligible backends", pm.modelID)
 	}
 
-	if affinityKey != "" {
-		pm.affinity[affinityKey] = affinityEntry{backendID: best, expires: now.Add(pm.ttl)}
+	// Establish affinity for new keys only. Do not re-home away from a busy
+	// sticky backend — temporary overflow should not steal the session.
+	if affinityKey != "" && pm.ttl > 0 {
+		if _, exists := pm.affinity[affinityKey]; !exists {
+			pm.affinity[affinityKey] = affinityEntry{backendID: best, expires: now.Add(pm.ttl)}
+		}
 	}
 	pm.inflight[best]++
 	return best, nil
@@ -636,7 +647,8 @@ func (pm *poolModel) stats() shared.PoolModelMetric {
 	}
 
 	backends := make([]shared.PoolBackendMetric, len(pm.backends))
-	for i, b := range pm.backends {
+	for i := range pm.backends {
+		b := &pm.backends[i]
 		m := shared.PoolBackendMetric{
 			ID:               b.id,
 			Proxy:            b.proxy,

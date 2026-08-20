@@ -52,16 +52,16 @@ func TestWatcher_NoFireOnBaseline(t *testing.T) {
 	path := filepath.Join(dir, "config.yaml")
 	require.NoError(t, os.WriteFile(path, []byte("a"), 0o644))
 
-	var n int64
+	var n atomic.Int64
 	stop := startWatcher(t, &Watcher{
 		Path:     path,
 		Interval: testInterval,
-		OnChange: func() { atomic.AddInt64(&n, 1) },
+		OnChange: func() { n.Add(1) },
 	})
 	defer stop()
 
 	time.Sleep(testInterval * 5)
-	require.Equal(t, int64(0), atomic.LoadInt64(&n), "baseline poll must not fire")
+	require.Equal(t, int64(0), n.Load(), "baseline poll must not fire")
 }
 
 func TestWatcher_DetectsModTimeChange(t *testing.T) {

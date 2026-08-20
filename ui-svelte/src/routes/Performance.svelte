@@ -24,6 +24,18 @@
     "#22d3ee",
   ];
 
+  /** Stable series color from a numeric id or string key (order-independent). */
+  function stableColor(key: string | number): string {
+    if (typeof key === "number") {
+      return COLORS[((key % COLORS.length) + COLORS.length) % COLORS.length];
+    }
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) {
+      hash = (hash * 31 + key.charCodeAt(i)) | 0;
+    }
+    return COLORS[((hash % COLORS.length) + COLORS.length) % COLORS.length];
+  }
+
   const WINDOWS = [
     { label: "5 min", ms: 5 * 60 * 1000 },
     { label: "15 min", ms: 15 * 60 * 1000 },
@@ -193,7 +205,7 @@
       datasets.push({
         label: `Core ${i}`,
         data: stats.map((s) => s.cpu_util_per_core[i]),
-        borderColor: COLORS[i % COLORS.length],
+        borderColor: stableColor(i),
       });
     }
     return datasets;
@@ -206,12 +218,12 @@
       {
         label: "Memory Used %",
         data: stats.map((s) => (s.mem_used_mb / s.mem_total_mb) * 100),
-        borderColor: "#3b82f6",
+        borderColor: stableColor("mem-used"),
       },
       {
         label: "Swap Used %",
         data: stats.map((s) => (s.swap_total_mb > 0 ? (s.swap_used_mb / s.swap_total_mb) * 100 : 0)),
-        borderColor: "#8b5cf6",
+        borderColor: stableColor("swap-used"),
       },
     ];
   });
@@ -237,17 +249,17 @@
       {
         label: "1 min",
         data: stats.map((s) => s.load_avg_1),
-        borderColor: "#10b981",
+        borderColor: stableColor("load-1"),
       },
       {
         label: "5 min",
         data: stats.map((s) => s.load_avg_5),
-        borderColor: "#f59e0b",
+        borderColor: stableColor("load-5"),
       },
       {
         label: "15 min",
         data: stats.map((s) => s.load_avg_15),
-        borderColor: "#ef4444",
+        borderColor: stableColor("load-15"),
       },
     ];
   });
@@ -267,7 +279,6 @@
     if (interfaces.length === 0) return [];
 
     const datasets: { label: string; data: number[]; borderColor: string }[] = [];
-    let colorIdx = 0;
 
     for (const iface of interfaces) {
       const recvData: number[] = [];
@@ -300,15 +311,13 @@
       datasets.push({
         label: `${iface} in`,
         data: recvData,
-        borderColor: COLORS[colorIdx % COLORS.length],
+        borderColor: stableColor(`${iface}:in`),
       });
-      colorIdx++;
       datasets.push({
         label: `${iface} out`,
         data: sentData,
-        borderColor: COLORS[colorIdx % COLORS.length],
+        borderColor: stableColor(`${iface}:out`),
       });
-      colorIdx++;
     }
 
     return datasets;
@@ -345,7 +354,10 @@
 
   function buildGpuDatasets(
     stats: GpuStat[],
-    field: keyof Pick<GpuStat, "gpu_util_pct" | "mem_util_pct" | "temp_c" | "vram_temp_c" | "power_draw_w">,
+    field: keyof Pick<
+      GpuStat,
+      "gpu_util_pct" | "mem_util_pct" | "temp_c" | "vram_temp_c" | "power_draw_w" | "clock_mhz" | "mem_clock_mhz"
+    >,
   ) {
     if (stats.length === 0) return [];
 
@@ -357,15 +369,16 @@
       byId.get(g.id)!.values.push(g[field] as number);
     }
 
+    // Sort by id and key color off id so series keep the same color across refreshes
+    // even when sample arrival order or which GPUs appear in the window changes.
     const datasets = [];
-    let colorIdx = 0;
-    for (const [id, entry] of byId) {
+    for (const id of [...byId.keys()].sort((a, b) => a - b)) {
+      const entry = byId.get(id)!;
       datasets.push({
         label: entry.name || `GPU ${id}`,
         data: entry.values,
-        borderColor: COLORS[colorIdx % COLORS.length],
+        borderColor: stableColor(id),
       });
-      colorIdx++;
     }
     return datasets;
   }
@@ -375,7 +388,11 @@
   const gpuTempDatasets = $derived(buildGpuDatasets(filteredGpuStats, "temp_c"));
   const gpuVramTempDatasets = $derived(buildGpuDatasets(filteredGpuStats, "vram_temp_c"));
   const gpuPowerDatasets = $derived(buildGpuDatasets(filteredGpuStats, "power_draw_w"));
+  const gpuClockDatasets = $derived(buildGpuDatasets(filteredGpuStats, "clock_mhz"));
+  const gpuMemClockDatasets = $derived(buildGpuDatasets(filteredGpuStats, "mem_clock_mhz"));
   const hasVramTemp = $derived(filteredGpuStats.some((g) => g.vram_temp_c > 0));
+  const hasGpuClock = $derived(filteredGpuStats.some((g) => g.clock_mhz > 0));
+  const hasMemClock = $derived(filteredGpuStats.some((g) => g.mem_clock_mhz > 0));
 </script>
 
 <div class="space-y-6">
@@ -480,6 +497,24 @@
           yMin={0}
           yLabel="W"
         />
+        {#if hasGpuClock}
+          <PerformanceChart
+            title="GPU Clock (MHz)"
+            labels={gpuLabels}
+            datasets={gpuClockDatasets}
+            yMin={0}
+            yLabel="MHz"
+          />
+        {/if}
+        {#if hasMemClock}
+          <PerformanceChart
+            title="GPU Memory Clock (MHz)"
+            labels={gpuLabels}
+            datasets={gpuMemClockDatasets}
+            yMin={0}
+            yLabel="MHz"
+          />
+        {/if}
       </div>
     {/if}
   </section>
@@ -603,7 +638,7 @@
             {#if peer.gpu_stats?.length > 0}
               <div class="text-xs text-txtsecondary space-y-1">
                 {#each peer.gpu_stats as gpu}
-                  <p>{gpu.name}: {gpu.gpu_util_pct.toFixed(1)}% util, {gpu.temp_c}°C, {((gpu.mem_used_mb / gpu.mem_total_mb) * 100).toFixed(1)}% VRAM</p>
+                  <p>{gpu.name}: {gpu.gpu_util_pct.toFixed(1)}% util, {gpu.temp_c}°C, {((gpu.mem_used_mb / gpu.mem_total_mb) * 100).toFixed(1)}% VRAM{#if gpu.clock_mhz > 0}, {gpu.clock_mhz} MHz{/if}</p>
                 {/each}
               </div>
             {/if}

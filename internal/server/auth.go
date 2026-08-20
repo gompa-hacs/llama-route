@@ -1,31 +1,95 @@
 package server
 
 import (
+	"bytes"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/mostlygeek/llama-swap/internal/auth"
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/tidwall/gjson"
 )
 
 // CreateInferenceAuthMiddleware validates inference API keys when any are
-// configured (static YAML keys or UI-managed keys).
+// configured (static YAML keys or UI-managed keys) and attaches the key policy
+// to the request context for downstream limit checks.
 func CreateInferenceAuthMiddleware(m *auth.Manager) chain.Middleware {
 	return func(next http.Handler) http.Handler {
-		if m == nil || !m.InferenceRequired() {
-			return next
-		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if m.ValidateInferenceKey(shared.ExtractAPIKey(r)) {
+			if m == nil || !m.InferenceRequired() {
 				next.ServeHTTP(w, r)
 				return
 			}
-			w.Header().Set("WWW-Authenticate", `Bearer realm="llama-swap"`)
-			shared.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
+			policy, ok := m.AuthenticateInferenceKey(shared.ExtractAPIKey(r))
+			if !ok {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="llama-swap"`)
+				shared.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(auth.ContextWithKeyPolicy(r.Context(), policy)))
 		})
 	}
+}
+
+// CreateKeyLimitsMiddleware enforces per-key model allow-lists and max token
+// caps after the request model has been resolved.
+func CreateKeyLimitsMiddleware(cfg config.Config) chain.Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			policy, ok := auth.KeyPolicyFromContext(r.Context())
+			if !ok || (len(policy.Models) == 0 && policy.MaxTokens <= 0) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			data, err := shared.FetchContext(r, cfg)
+			if err != nil {
+				shared.SendError(w, r, shared.ErrNoModelInContext)
+				return
+			}
+
+			if !policy.AllowsModel(data.Model, data.ModelID) {
+				shared.SendResponse(w, r, http.StatusForbidden, "forbidden: API key is not allowed to use this model")
+				return
+			}
+
+			if policy.MaxTokens > 0 && strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					shared.SendResponse(w, r, http.StatusBadRequest, "could not read request body")
+					return
+				}
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				if exceeded, field, value := requestedTokensExceed(body, policy.MaxTokens); exceeded {
+					shared.SendResponse(w, r, http.StatusForbidden,
+						"forbidden: "+field+" ("+strconv.FormatInt(value, 10)+") exceeds API key maxTokens ("+strconv.FormatInt(policy.MaxTokens, 10)+")")
+					return
+				}
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// requestedTokensExceed reports whether a JSON body asks for more tokens than
+// the key allows via max_tokens or max_completion_tokens.
+func requestedTokensExceed(body []byte, limit int64) (bool, string, int64) {
+	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
+		v := gjson.GetBytes(body, field)
+		if !v.Exists() {
+			continue
+		}
+		n := v.Int()
+		if n > limit {
+			return true, field, n
+		}
+	}
+	return false, "", 0
 }
 
 // CreateAdminAuthMiddleware protects dashboard routes.
@@ -50,12 +114,14 @@ func CreateAdminAuthMiddleware(m *auth.Manager) chain.Middleware {
 				return
 			}
 			if m.InferenceRequired() {
-				if m.ValidateInferenceKey(shared.ExtractAPIKey(r)) {
-					next.ServeHTTP(w, r)
+				policy, ok := m.AuthenticateInferenceKey(shared.ExtractAPIKey(r))
+				if !ok {
+					w.Header().Set("WWW-Authenticate", `Bearer realm="llama-swap"`)
+					shared.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
 					return
 				}
-				w.Header().Set("WWW-Authenticate", `Bearer realm="llama-swap"`)
-				shared.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
+				r = r.WithContext(auth.ContextWithKeyPolicy(r.Context(), policy))
+				next.ServeHTTP(w, r)
 				return
 			}
 			next.ServeHTTP(w, r)

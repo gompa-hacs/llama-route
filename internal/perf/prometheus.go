@@ -90,6 +90,8 @@ func writeGpuMetrics(w http.ResponseWriter, gpus []GpuStat) {
 		{"GPU memory total in bytes", "llamaswap_gpu_memory_total_bytes", func(g GpuStat) float64 { return float64(g.MemTotalMB) * float64(mbToBytes) }},
 		{"GPU fan speed percent (0-100)", "llamaswap_gpu_fan_speed_percent", func(g GpuStat) float64 { return g.FanSpeedPct }},
 		{"GPU power draw in watts", "llamaswap_gpu_power_draw_watts", func(g GpuStat) float64 { return g.PowerDrawW }},
+		{"GPU graphics clock in MHz", "llamaswap_gpu_clock_mhz", func(g GpuStat) float64 { return float64(g.ClockMHz) }},
+		{"GPU memory clock in MHz", "llamaswap_gpu_mem_clock_mhz", func(g GpuStat) float64 { return float64(g.MemClockMHz) }},
 	}
 
 	for _, m := range metrics {

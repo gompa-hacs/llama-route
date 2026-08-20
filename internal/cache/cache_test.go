@@ -112,11 +112,11 @@ func TestCache_Concurrent(t *testing.T) {
 		c := New(10000)
 
 		var wg sync.WaitGroup
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
-				for j := 0; j < 100; j++ {
+				for j := range 100 {
 					key := id*100 + j
 					_ = c.Add(key, []byte("data"))
 					_, _ = c.Get(key)
