@@ -251,8 +251,10 @@ func (s *Server) routes() {
 	mux.HandleFunc("GET /wol-health", handleHealth)
 	mux.HandleFunc("GET /{$}", handleRootRedirect)
 
-	mux.Handle("GET /ui/", dashboardChain.ThenFunc(s.handleUI))
-	mux.Handle("GET /favicon.ico", dashboardChain.ThenFunc(s.handleFavicon))
+	// SPA + favicon stay public so the login form can load. API/ops routes
+	// below still require the session cookie when admin.password is set.
+	mux.HandleFunc("GET /ui/", s.handleUI)
+	mux.HandleFunc("GET /favicon.ico", s.handleFavicon)
 
 	mux.Handle("GET /metrics", dashboardChain.ThenFunc(s.handleMetrics))
 

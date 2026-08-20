@@ -109,7 +109,8 @@ func CreateAdminAuthMiddleware(m *auth.Manager) chain.Middleware {
 					next.ServeHTTP(w, r)
 					return
 				}
-				w.Header().Set("WWW-Authenticate", `Basic realm="llama-swap"`)
+				// Do not send WWW-Authenticate: Basic — browsers would show a
+				// native username/password dialog and never load the SPA login.
 				shared.SendResponse(w, r, http.StatusUnauthorized, "unauthorized: admin login required")
 				return
 			}

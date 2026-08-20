@@ -231,6 +231,39 @@ func TestServer_AdminAuthMiddleware_SessionOnly(t *testing.T) {
 			t.Fatalf("status = %d, want 200", w.Code)
 		}
 	})
+
+	t.Run("no basic auth challenge", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		mw(final).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/metrics", nil))
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", w.Code)
+		}
+		if got := w.Header().Get("WWW-Authenticate"); got != "" {
+			t.Fatalf("WWW-Authenticate = %q, want empty (browser Basic dialog)", got)
+		}
+	})
+}
+
+func TestServer_UI_PublicWhenAdminRequired(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	mgr, err := auth.NewManager(config.Config{Admin: config.AdminConfig{Password: "pw"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.auth = mgr
+	s.routes()
+
+	ui := httptest.NewRecorder()
+	s.ServeHTTP(ui, httptest.NewRequest(http.MethodGet, "/ui/", nil))
+	if ui.Code == http.StatusUnauthorized {
+		t.Fatal("GET /ui/ must stay public so the login form can load")
+	}
+
+	running := httptest.NewRecorder()
+	s.ServeHTTP(running, httptest.NewRequest(http.MethodGet, "/running", nil))
+	if running.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /running status = %d, want 401", running.Code)
+	}
 }
 
 func TestServer_StripClientAuthMiddleware(t *testing.T) {
