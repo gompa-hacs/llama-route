@@ -760,8 +760,3 @@ func probeBackend(proxyURL string, parentCtx context.Context) (contextSize int, 
 	}
 	return 0, true
 }
-
-func probeContextSize(proxyURL string, parentCtx context.Context) int {
-	cs, _ := probeBackend(proxyURL, parentCtx)
-	return cs
-}
