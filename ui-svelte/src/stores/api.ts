@@ -66,6 +66,8 @@ export function enableAPIEvents(enabled: boolean): void {
       metrics.set([]);
       inFlightRequests.set(0);
       models.set([]);
+      peerPerformance.set(null);
+      poolMetrics.set(null);
       retryCount = 0;
       connectionState.set("connected");
     };

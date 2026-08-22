@@ -194,6 +194,23 @@ func TestServer_HandleListModels_Status(t *testing.T) {
 	}
 }
 
+func TestServer_HandleListModels_ModelsAliasRoute(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"m1": {Name: "Model One"}}}
+
+	wV1 := httptest.NewRecorder()
+	s.ServeHTTP(wV1, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	wAlias := httptest.NewRecorder()
+	s.ServeHTTP(wAlias, httptest.NewRequest(http.MethodGet, "/models", nil))
+
+	if wV1.Code != http.StatusOK || wAlias.Code != http.StatusOK {
+		t.Fatalf("status v1=%d alias=%d", wV1.Code, wAlias.Code)
+	}
+	if wV1.Body.String() != wAlias.Body.String() {
+		t.Errorf("/models response differs from /v1/models")
+	}
+}
+
 func TestServer_FindModelInPath(t *testing.T) {
 	cfg := config.Config{Models: map[string]config.ModelConfig{
 		"author":       {},

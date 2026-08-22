@@ -11,6 +11,8 @@ on:
       - 'go.mod'
       - 'go.sum'
       - 'Makefile'
+      - '.gitignore'
+      - 'internal/server/ui_dist/placeholder.txt'
       - '.github/workflows/go-ci-windows.yml'
 
   pull_request:
@@ -21,6 +23,8 @@ on:
       - 'go.mod'
       - 'go.sum'
       - 'Makefile'
+      - '.gitignore'
+      - 'internal/server/ui_dist/placeholder.txt'
       - '.github/workflows/go-ci-windows.yml'
 
   # Allows manual triggering of the workflow
