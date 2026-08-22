@@ -1,0 +1,63 @@
+# Whisper pool — one model name, one stock whisper-server per Vulkan GPU
+#
+# Stock whisper-server speaks POST /inference. llama-route auto-detects
+# whisper-server and rewrites OpenAI POST /v1/audio/transcriptions → /inference
+# (and defaults health checks to /). No --request-path flags needed.
+#
+# Stop any systemd whisper units first so they do not fight for GPUs.
+#
+# Run:
+#   llama-swap --config docs/examples/whisper-pool/config.yaml --listen 0.0.0.0:8080
+#
+# Clients may use either:
+#   POST /v1/audio/transcriptions  (OpenAI / playground)
+#   POST /inference                (native whisper.cpp)
+
+healthCheckTimeout: 120
+logLevel: info
+startPort: 10000
+
+models:
+  whisper:
+    name: "Whisper large-v3-turbo"
+    description: "large-v3-turbo load-balanced across Vulkan GPUs"
+    capabilities:
+      in: [audio]
+      out: [text]
+
+    pool:
+      start: preload
+      restartOnCrash: true
+      strategy: sticky_least_inflight
+      affinityTTL: 5m
+
+      backends:
+        - cmd: >
+            /home/gompa/workspace/whisper.cpp/build/bin/whisper-server
+            --port ${PORT}
+            -m /home/gompa/workspace/whisper.cpp/models/ggml-large-v3-turbo.bin
+            --host 127.0.0.1
+            -t 2
+          env:
+            - "GGML_VK_VISIBLE_DEVICES=0"
+            - "CUDA_VISIBLE_DEVICES="
+
+        - cmd: >
+            /home/gompa/workspace/whisper.cpp/build/bin/whisper-server
+            --port ${PORT}
+            -m /home/gompa/workspace/whisper.cpp/models/ggml-large-v3-turbo.bin
+            --host 127.0.0.1
+            -t 2
+          env:
+            - "GGML_VK_VISIBLE_DEVICES=1"
+            - "CUDA_VISIBLE_DEVICES="
+
+        - cmd: >
+            /home/gompa/workspace/whisper.cpp/build/bin/whisper-server
+            --port ${PORT}
+            -m /home/gompa/workspace/whisper.cpp/models/ggml-large-v3-turbo.bin
+            --host 127.0.0.1
+            -t 2
+          env:
+            - "GGML_VK_VISIBLE_DEVICES=2"
+            - "CUDA_VISIBLE_DEVICES="
