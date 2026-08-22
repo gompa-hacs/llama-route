@@ -21,6 +21,7 @@ export interface Model {
   peerID: string;
   aliases?: string[];
   capabilities?: ModelCapabilities;
+  context_length?: number;
 }
 
 export interface TokenMetrics {
@@ -156,7 +157,7 @@ export interface PoolMetricsSnapshot {
 }
 
 export interface APIEventEnvelope {
-  type: "modelStatus" | "logData" | "metrics" | "inflight" | "peerMetrics" | "poolMetrics";
+  type: "modelStatus" | "logData" | "metrics" | "inflight" | "peerMetrics" | "peerPerformance" | "poolMetrics";
   data: string;
 }
 

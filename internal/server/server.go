@@ -245,7 +245,9 @@ func (s *Server) routes() {
 	}
 
 	// OpenAI model listing uses inference keys.
-	mux.Handle("GET /v1/models", chain.New(inferenceAuth).ThenFunc(s.handleListModels))
+	apiChain := chain.New(inferenceAuth)
+	mux.Handle("GET /v1/models", apiChain.ThenFunc(s.handleListModels))
+	mux.Handle("GET /models", apiChain.ThenFunc(s.handleListModels))
 
 	// Public auth endpoints for the dashboard login flow.
 	mux.HandleFunc("GET /api/auth/session", s.handleAuthSession)

@@ -11,20 +11,22 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/peermetrics"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
 // apiModel is one entry in the /api/events modelStatus payload.
 type apiModel struct {
-	Id           string         `json:"id"`
-	Name         string         `json:"name"`
-	Description  string         `json:"description"`
-	State        string         `json:"state"`
-	Unlisted     bool           `json:"unlisted"`
-	PeerID       string         `json:"peerID"`
-	Aliases      []string       `json:"aliases,omitempty"`
-	Capabilities map[string]any `json:"capabilities,omitempty"`
+	Id            string         `json:"id"`
+	Name          string         `json:"name"`
+	Description   string         `json:"description"`
+	State         string         `json:"state"`
+	Unlisted      bool           `json:"unlisted"`
+	PeerID        string         `json:"peerID"`
+	Aliases       []string       `json:"aliases,omitempty"`
+	Capabilities  map[string]any `json:"capabilities,omitempty"`
+	ContextLength int            `json:"context_length,omitempty"`
 }
 
 // modelStatus returns every configured model joined with its current process
@@ -48,15 +50,24 @@ func (s *Server) modelStatus() []apiModel {
 		} else if st, ok := running[id]; ok {
 			state = string(st)
 		}
-		_, capsMap, _, _ := renderCapabilities(mc.Capabilities)
+		_, capsMap, _, ctxLen := renderCapabilities(mc.Capabilities)
+		// Fall back to auto-detected / cmd-parsed context when capabilities.context
+		// is unset, matching /v1/models so the Models page tags stay accurate.
+		if ctxLen == 0 {
+			ctxLen = s.local.UpstreamContextLength(id)
+		}
+		if ctxLen == 0 {
+			ctxLen = mc.ExtractContextSizeFromCmd()
+		}
 		models = append(models, apiModel{
-			Id:           id,
-			Name:         mc.Name,
-			Description:  mc.Description,
-			State:        state,
-			Unlisted:     mc.Unlisted,
-			Aliases:      mc.Aliases,
-			Capabilities: capsMap,
+			Id:            id,
+			Name:          mc.Name,
+			Description:   mc.Description,
+			State:         state,
+			Unlisted:      mc.Unlisted,
+			Aliases:       mc.Aliases,
+			Capabilities:  capsMap,
+			ContextLength: ctxLen,
 		})
 	}
 
@@ -67,10 +78,11 @@ func (s *Server) modelStatus() []apiModel {
 				name = listing.PeerID + ": " + listing.UpstreamModelID
 			}
 			models = append(models, apiModel{
-				Id:     listing.ID,
-				Name:   name,
-				State:  "ready",
-				PeerID: listing.PeerID,
+				Id:            listing.ID,
+				Name:          name,
+				State:         "ready",
+				PeerID:        listing.PeerID,
+				ContextLength: listing.ContextSize,
 			})
 		}
 	}
@@ -210,12 +222,13 @@ func (s *Server) handleAPICapture(w http.ResponseWriter, r *http.Request) {
 type messageType string
 
 const (
-	msgTypeModelStatus messageType = "modelStatus"
-	msgTypeLogData     messageType = "logData"
-	msgTypeMetrics     messageType = "metrics"
-	msgTypePeerMetrics messageType = "peerMetrics"
-	msgTypePoolMetrics messageType = "poolMetrics"
-	msgTypeInFlight    messageType = "inflight"
+	msgTypeModelStatus     messageType = "modelStatus"
+	msgTypeLogData         messageType = "logData"
+	msgTypeMetrics         messageType = "metrics"
+	msgTypePeerMetrics     messageType = "peerMetrics"
+	msgTypePeerPerformance messageType = "peerPerformance"
+	msgTypePoolMetrics     messageType = "poolMetrics"
+	msgTypeInFlight        messageType = "inflight"
 )
 
 type messageEnvelope struct {
@@ -279,6 +292,11 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			send(messageEnvelope{Type: msgTypePeerMetrics, Data: string(j)})
 		}
 	}
+	sendPeerPerformance := func(latest peermetrics.LatestPeerMetrics) {
+		if j, err := json.Marshal(latest); err == nil {
+			send(messageEnvelope{Type: msgTypePeerPerformance, Data: string(j)})
+		}
+	}
 	sendPoolMetrics := func(snapshot shared.PoolMetricsSnapshot) {
 		if j, err := json.Marshal(snapshot); err == nil {
 			send(messageEnvelope{Type: msgTypePoolMetrics, Data: string(j)})
@@ -292,6 +310,7 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	defer event.On(func(e ActivityLogEvent) { sendMetrics([]ActivityLogEntry{e.Metrics}) })()
 	defer event.On(func(e shared.InFlightRequestsEvent) { sendInFlight(e.Total) })()
 	defer event.On(func(e shared.PeerMetricsUpdateEvent) { sendPeerMetrics(e.Peers) })()
+	defer event.On(func(e peermetrics.PeerPerformanceUpdateEvent) { sendPeerPerformance(e.Snapshot) })()
 	defer event.On(func(e shared.PoolMetricsUpdateEvent) { sendPoolMetrics(e.Snapshot) })()
 
 	// initial payload
@@ -300,6 +319,9 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	sendModels()
 	sendMetrics(s.metrics.getMetrics())
 	sendInFlight(int(s.inflight.Current()))
+	if s.peerMetrics != nil {
+		sendPeerPerformance(s.peerMetrics.GetLatest())
+	}
 	if s.pool != nil {
 		sendPoolMetrics(s.pool.Stats())
 	}

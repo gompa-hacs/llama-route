@@ -1,3 +1,4 @@
+import { authFetch } from "../stores/auth";
 import type { ImageGenerationRequest, ImageGenerationResponse } from "./types";
 
 export async function generateImage(
@@ -13,7 +14,7 @@ export async function generateImage(
     size,
   };
 
-  const response = await fetch("/v1/images/generations", {
+  const response = await authFetch("/v1/images/generations", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

@@ -2,6 +2,7 @@
   import { models, loadModel, unloadAllModels, unloadSingleModel } from "../stores/api";
   import { isNarrow } from "../stores/theme";
   import { persistentStore } from "../stores/persistent";
+  import { listCapabilityBadges, capabilityBadgeClass } from "../lib/capabilities";
   import type { Model } from "../lib/types";
 
   let isUnloading = $state(false);
@@ -11,6 +12,8 @@
 
   const showUnlistedStore = persistentStore<boolean>("showUnlisted", true);
   const showIdorNameStore = persistentStore<"id" | "name">("showIdorName", "id");
+  // Off by default to keep the list dense (matches upstream Models page toggle).
+  const showCapabilityTags = persistentStore<boolean>("models-show-capability-tags", false);
 
   let filteredModels = $derived.by(() => {
     const filtered = $models.filter((model) => $showUnlistedStore || !model.unlisted);
@@ -71,6 +74,10 @@
     showUnlistedStore.update((prev) => !prev);
   }
 
+  function toggleCapabilityTags(): void {
+    showCapabilityTags.update((prev) => !prev);
+  }
+
   function getModelDisplay(model: Model): string {
     return $showIdorNameStore === "id" ? model.id : (model.name || model.id);
   }
@@ -118,6 +125,12 @@
               </button>
               <button
                 class="w-full text-left px-4 py-2 hover:bg-secondary-hover flex items-center gap-2"
+                onclick={() => { toggleCapabilityTags(); menuOpen = false; }}
+              >
+                {$showCapabilityTags ? "Hide Caps" : "Show Caps"}
+              </button>
+              <button
+                class="w-full text-left px-4 py-2 hover:bg-secondary-hover flex items-center gap-2"
                 onclick={() => { handleUnloadAllModels(); menuOpen = false; }}
                 disabled={isUnloading}
               >
@@ -156,6 +169,16 @@
             {/if}
             unlisted
           </button>
+
+          <button
+            class="btn text-base flex items-center gap-2"
+            class:font-semibold={$showCapabilityTags}
+            onclick={toggleCapabilityTags}
+            style="line-height: 1.2"
+            title="Show capability tags (vision, tools, context, …)"
+          >
+            caps
+          </button>
         </div>
         <button class="btn text-base flex items-center gap-2" onclick={handleUnloadAllModels} disabled={isUnloading}>
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-6 h-6">
@@ -188,6 +211,16 @@
               {/if}
               {#if model.aliases && model.aliases.length > 0}
                 <p class="text-xs text-txtsecondary">Aliases: {model.aliases.join(", ")}</p>
+              {/if}
+              {#if $showCapabilityTags}
+                {@const badges = listCapabilityBadges(model)}
+                {#if badges.length > 0}
+                  <div class="mt-1 flex flex-wrap gap-1">
+                    {#each badges as badge (badge.key)}
+                      <span class="rounded px-1.5 py-0.5 text-[0.625rem] font-medium {capabilityBadgeClass[badge.key] ?? ""}">{badge.label}</span>
+                    {/each}
+                  </div>
+                {/if}
               {/if}
             </td>
             <td class="w-12">
@@ -226,6 +259,16 @@
                 <tr class="border-b hover:bg-secondary-hover border-gray-200">
                   <td class="pl-8 {model.unlisted ? 'text-txtsecondary' : ''}">
                     <span>{model.id}</span>
+                    {#if $showCapabilityTags}
+                      {@const badges = listCapabilityBadges(model)}
+                      {#if badges.length > 0}
+                        <div class="mt-1 flex flex-wrap gap-1">
+                          {#each badges as badge (badge.key)}
+                            <span class="rounded px-1.5 py-0.5 text-[0.625rem] font-medium {capabilityBadgeClass[badge.key] ?? ""}">{badge.label}</span>
+                          {/each}
+                        </div>
+                      {/if}
+                    {/if}
                   </td>
                 </tr>
               {/each}

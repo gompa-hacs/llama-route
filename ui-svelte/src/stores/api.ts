@@ -24,6 +24,7 @@ export const upstreamLogs = writable<string>("");
 export const metrics = writable<ActivityLogEntry[]>([]);
 export const inFlightRequests = writable<number>(0);
 export const peerMetrics = writable<PeerMetricEntry[]>([]);
+export const peerPerformance = writable<PeerMetricsResponse | null>(null);
 export const poolMetrics = writable<PoolMetricsSnapshot | null>(null);
 export const versionInfo = writable<VersionInfo>({
   build_date: "unknown",
@@ -109,6 +110,11 @@ export function enableAPIEvents(enabled: boolean): void {
           case "peerMetrics": {
             const newPeerMetrics = JSON.parse(message.data) as PeerMetricEntry[];
             peerMetrics.set(newPeerMetrics);
+            break;
+          }
+          case "peerPerformance": {
+            const snapshot = JSON.parse(message.data) as PeerMetricsResponse;
+            peerPerformance.set(snapshot);
             break;
           }
           case "poolMetrics": {

@@ -1,3 +1,4 @@
+import { authFetch } from "../stores/auth";
 import type { SpeechGenerationRequest } from "./types";
 
 export async function generateSpeech(
@@ -12,7 +13,7 @@ export async function generateSpeech(
     voice,
   };
 
-  const response = await fetch("/v1/audio/speech", {
+  const response = await authFetch("/v1/audio/speech", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

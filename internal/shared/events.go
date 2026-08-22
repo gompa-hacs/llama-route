@@ -9,6 +9,7 @@ const ModelPreloadedEventID = 0x06
 const InFlightRequestsEventID = 0x07
 const PeerMetricsUpdateEventID = 0x08
 const PoolMetricsUpdateEventID = 0x09
+const PeerPerformanceUpdateEventID = 0x0A
 
 // ProcessStateChangeEvent is emitted whenever a process transitions between
 // lifecycle states. States are carried as strings so this package stays a leaf

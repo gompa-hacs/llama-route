@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { fetchPerformance, fetchPeerMetrics, fetchPoolMetrics, poolMetrics } from "../stores/api";
+  import { fetchPerformance, fetchPeerMetrics, fetchPoolMetrics, poolMetrics, peerPerformance } from "../stores/api";
   import { persistentStore } from "../stores/persistent";
   import type { SysStat, GpuStat, PeerSnapshot, PoolMetricsSnapshot } from "../lib/types";
   import PerformanceChart from "../components/PerformanceChart.svelte";
@@ -115,8 +115,7 @@
     });
   }
 
-  async function loadPeerData() {
-    const resp = await fetchPeerMetrics();
+  function applyPeerPerformance(resp: { peers?: Record<string, PeerSnapshot>; poll_time?: string } | null) {
     if (resp) {
       peerData = resp.peers ?? {};
       peerPollTime = resp.poll_time ?? "";
@@ -162,7 +161,7 @@
       sysData = resp.sys_stats ?? [];
       gpuData = resp.gpu_stats ?? [];
     }
-    await Promise.all([loadPoolData(), loadPeerData()]);
+    await loadPoolData();
   }
 
   async function loadIncremental() {
@@ -178,7 +177,6 @@
         gpuData = [...gpuData, ...newGpu];
       }
     }
-    await Promise.all([loadPoolData(), loadPeerData()]);
   }
 
   function startPolling() {
@@ -218,6 +216,8 @@
   async function manualRefresh() {
     refreshing = true;
     await loadIncremental();
+    const peerResp = await fetchPeerMetrics();
+    applyPeerPerformance(peerResp);
     refreshing = false;
   }
 
@@ -235,11 +235,15 @@
     const unsubPool = poolMetrics.subscribe((snap) => {
       if (snap) poolData = snap;
     });
+    const unsubPeer = peerPerformance.subscribe((snap) => {
+      applyPeerPerformance(snap);
+    });
 
     return () => {
       mounted = false;
       stopPolling();
       unsubPool();
+      unsubPeer();
       document.removeEventListener("visibilitychange", handleVisibility);
     };
   });

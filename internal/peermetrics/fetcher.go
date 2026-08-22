@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -15,6 +16,9 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/ring"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
+
+// peerPerfRingCapacity matches the local perf monitor (~1h at 5s samples).
+const peerPerfRingCapacity = 720
 
 // FetcherConfig holds configuration for the peer metrics fetcher.
 type FetcherConfig struct {
@@ -47,15 +51,31 @@ type LatestPeerMetrics struct {
 	Peers    map[string]PeerSnapshot `json:"peers"`
 }
 
+// PeerPerformanceUpdateEvent is emitted when peer sys/GPU rings are refreshed.
+type PeerPerformanceUpdateEvent struct {
+	Snapshot LatestPeerMetrics
+}
+
+func (e PeerPerformanceUpdateEvent) Type() uint32 {
+	return shared.PeerPerformanceUpdateEventID
+}
+
+type peerPerfState struct {
+	lastAfter time.Time
+	sysRing   ring.Buffer[perf.SysStat]
+	gpuRing   ring.Buffer[perf.GpuStat]
+}
+
 // Fetcher periodically polls peers for their metrics and performance data.
 type Fetcher struct {
 	peers  config.PeerDictionaryConfig
 	cfg    FetcherConfig
 	logger *logmon.Monitor
 
-	mu      sync.RWMutex
-	latest  LatestPeerMetrics
-	history ring.Buffer[LatestPeerMetrics]
+	mu       sync.RWMutex
+	latest   LatestPeerMetrics
+	history  ring.Buffer[LatestPeerMetrics]
+	peerPerf map[string]*peerPerfState
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -69,12 +89,24 @@ func NewFetcher(peers config.PeerDictionaryConfig, cfg FetcherConfig, logger *lo
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 5 * time.Second
 	}
+	peerPerf := make(map[string]*peerPerfState, len(peers))
+	for name := range peers {
+		peerPerf[name] = newPeerPerfState()
+	}
 	return &Fetcher{
-		peers:   peers,
-		cfg:     cfg,
-		logger:  logger,
-		history: ring.NewBuffer[LatestPeerMetrics](100),
-		done:    make(chan struct{}),
+		peers:    peers,
+		cfg:      cfg,
+		logger:   logger,
+		peerPerf: peerPerf,
+		history:  ring.NewBuffer[LatestPeerMetrics](100),
+		done:     make(chan struct{}),
+	}
+}
+
+func newPeerPerfState() *peerPerfState {
+	return &peerPerfState{
+		sysRing: ring.NewBuffer[perf.SysStat](peerPerfRingCapacity),
+		gpuRing: ring.NewBuffer[perf.GpuStat](peerPerfRingCapacity),
 	}
 }
 
@@ -106,6 +138,45 @@ func (f *Fetcher) GetHistory() []LatestPeerMetrics {
 	return f.history.Slice()
 }
 
+func (f *Fetcher) peerPerfSnapshot(name string) (sys []perf.SysStat, gpu []perf.GpuStat) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	state, ok := f.peerPerf[name]
+	if !ok || state == nil {
+		return nil, nil
+	}
+	return state.sysRing.Slice(), state.gpuRing.Slice()
+}
+
+func (f *Fetcher) mergePeerPerf(name string, sys []perf.SysStat, gpu []perf.GpuStat) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state, ok := f.peerPerf[name]
+	if !ok || state == nil {
+		state = newPeerPerfState()
+		f.peerPerf[name] = state
+	}
+	after := state.lastAfter
+	for _, st := range sys {
+		if !after.IsZero() && !st.Timestamp.After(after) {
+			continue
+		}
+		state.sysRing.Push(st)
+		if st.Timestamp.After(state.lastAfter) {
+			state.lastAfter = st.Timestamp
+		}
+	}
+	for _, g := range gpu {
+		if !after.IsZero() && !g.Timestamp.After(after) {
+			continue
+		}
+		state.gpuRing.Push(g)
+		if g.Timestamp.After(state.lastAfter) {
+			state.lastAfter = g.Timestamp
+		}
+	}
+}
+
 // run is the main polling loop.
 func (f *Fetcher) run(ctx context.Context) {
 	defer close(f.done)
@@ -113,7 +184,6 @@ func (f *Fetcher) run(ctx context.Context) {
 	ticker := time.NewTicker(f.cfg.Interval)
 	defer ticker.Stop()
 
-	// Initial poll.
 	f.pollAll()
 
 	for {
@@ -155,8 +225,7 @@ func (f *Fetcher) pollAll() {
 	f.history.Push(latest)
 	f.mu.Unlock()
 
-	// Emit event so SSE subscribers can update.
-	f.emitEvent(latest)
+	f.emitEvents(latest)
 }
 
 // pollPeer fetches metrics and performance data from a single peer.
@@ -172,12 +241,12 @@ func (f *Fetcher) pollPeer(name string, peer config.PeerConfig) PeerSnapshot {
 
 	client := &http.Client{Timeout: f.cfg.Timeout}
 
-	// Fetch activity metrics.
 	metricsURL := peer.ProxyURL.JoinPath("/api/metrics").String()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metricsURL, nil)
 	if err != nil {
 		snapshot.Success = false
 		snapshot.Error = fmt.Sprintf("creating metrics request: %v", err)
+		snapshot.SysStats, snapshot.GpuStats = f.peerPerfSnapshot(name)
 		return snapshot
 	}
 	if peer.ApiKey != "" {
@@ -188,11 +257,11 @@ func (f *Fetcher) pollPeer(name string, peer config.PeerConfig) PeerSnapshot {
 	if err != nil {
 		snapshot.Success = false
 		snapshot.Error = fmt.Sprintf("fetching metrics: %v", err)
+		snapshot.SysStats, snapshot.GpuStats = f.peerPerfSnapshot(name)
 		return snapshot
 	}
 
 	if resp.StatusCode == http.StatusOK {
-		// Decode the ActivityLogEntry array and convert to PeerMetricEntry.
 		var entries []struct {
 			Model     string    `json:"model"`
 			Timestamp time.Time `json:"timestamp"`
@@ -207,6 +276,7 @@ func (f *Fetcher) pollPeer(name string, peer config.PeerConfig) PeerSnapshot {
 			resp.Body.Close()
 			snapshot.Success = false
 			snapshot.Error = fmt.Sprintf("decoding metrics: %v", err)
+			snapshot.SysStats, snapshot.GpuStats = f.peerPerfSnapshot(name)
 			return snapshot
 		}
 		resp.Body.Close()
@@ -230,51 +300,74 @@ func (f *Fetcher) pollPeer(name string, peer config.PeerConfig) PeerSnapshot {
 		resp.Body.Close()
 	}
 
-	// Fetch performance data.
-	perfURL := peer.ProxyURL.JoinPath("/api/performance").String()
-	req, err = http.NewRequestWithContext(ctx, http.MethodGet, perfURL, nil)
-	if err != nil {
-		snapshot.Success = false
-		snapshot.Error = fmt.Sprintf("creating performance request: %v", err)
+	sys, gpu, perfErr := f.fetchPeerPerformance(ctx, client, peer, name)
+	if perfErr != nil {
+		if snapshot.Error == "" {
+			snapshot.Success = false
+			snapshot.Error = perfErr.Error()
+		}
+		snapshot.SysStats, snapshot.GpuStats = f.peerPerfSnapshot(name)
 		return snapshot
+	}
+
+	f.mergePeerPerf(name, sys, gpu)
+	snapshot.SysStats, snapshot.GpuStats = f.peerPerfSnapshot(name)
+	return snapshot
+}
+
+func (f *Fetcher) fetchPeerPerformance(ctx context.Context, client *http.Client, peer config.PeerConfig, peerName string) ([]perf.SysStat, []perf.GpuStat, error) {
+	f.mu.RLock()
+	var after time.Time
+	if state := f.peerPerf[peerName]; state != nil {
+		after = state.lastAfter
+	}
+	f.mu.RUnlock()
+
+	perfURL := peer.ProxyURL.JoinPath("/api/performance").String()
+	if !after.IsZero() {
+		u, err := url.Parse(perfURL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parsing performance URL: %w", err)
+		}
+		q := u.Query()
+		q.Set("after", after.Format(time.RFC3339))
+		u.RawQuery = q.Encode()
+		perfURL = u.String()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, perfURL, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating performance request: %v", err)
 	}
 	if peer.ApiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+peer.ApiKey)
 	}
 
-	resp, err = client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		snapshot.Success = false
-		snapshot.Error = fmt.Sprintf("fetching performance: %v", err)
-		return snapshot
+		return nil, nil, fmt.Errorf("fetching performance: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("performance status %d", resp.StatusCode)
 	}
 
-	if resp.StatusCode == http.StatusOK {
-		var perfData struct {
-			SysStats []perf.SysStat `json:"sys_stats"`
-			GpuStats []perf.GpuStat `json:"gpu_stats"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&perfData); err != nil {
-			resp.Body.Close()
-			snapshot.Success = false
-			snapshot.Error = fmt.Sprintf("decoding performance: %v", err)
-			return snapshot
-		}
-		resp.Body.Close()
-		snapshot.SysStats = perfData.SysStats
-		snapshot.GpuStats = perfData.GpuStats
-	} else {
-		resp.Body.Close()
+	var perfData struct {
+		SysStats []perf.SysStat `json:"sys_stats"`
+		GpuStats []perf.GpuStat `json:"gpu_stats"`
 	}
-
-	return snapshot
+	if err := json.NewDecoder(resp.Body).Decode(&perfData); err != nil {
+		return nil, nil, fmt.Errorf("decoding performance: %v", err)
+	}
+	return perfData.SysStats, perfData.GpuStats, nil
 }
 
-// emitEvent emits a PeerMetricsUpdateEvent to the event bus.
-func (f *Fetcher) emitEvent(latest LatestPeerMetrics) {
+func (f *Fetcher) emitEvents(latest LatestPeerMetrics) {
 	var allMetrics []shared.PeerMetricEntry
 	for _, peer := range latest.Peers {
 		allMetrics = append(allMetrics, peer.Metrics...)
 	}
 	event.Emit(shared.PeerMetricsUpdateEvent{Peers: allMetrics})
+	event.Emit(PeerPerformanceUpdateEvent{Snapshot: latest})
 }

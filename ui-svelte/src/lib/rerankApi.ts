@@ -1,3 +1,5 @@
+import { authFetch } from "../stores/auth";
+
 export interface RerankResult {
   index: number;
   relevance_score: number;
@@ -16,7 +18,7 @@ export async function rerank(
   documents: string[],
   signal: AbortSignal
 ): Promise<RerankResponse> {
-  const response = await fetch("/v1/rerank", {
+  const response = await authFetch("/v1/rerank", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model, query, documents }),

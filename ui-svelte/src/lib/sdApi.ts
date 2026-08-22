@@ -1,10 +1,11 @@
+import { authFetch } from "../stores/auth";
 import type { SdApiTxt2ImgRequest, SdApiResponse, SdApiLora } from "./types";
 
 export async function generateSdImage(
   request: SdApiTxt2ImgRequest,
   signal?: AbortSignal
 ): Promise<SdApiResponse> {
-  const response = await fetch("/sdapi/v1/txt2img", {
+  const response = await authFetch("/sdapi/v1/txt2img", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -25,7 +26,7 @@ export async function fetchSdLoras(
   model: string,
   signal?: AbortSignal
 ): Promise<SdApiLora[]> {
-  const response = await fetch(
+  const response = await authFetch(
     `/sdapi/v1/loras?model=${encodeURIComponent(model)}`,
     { signal }
   );

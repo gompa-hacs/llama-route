@@ -12,6 +12,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/discovery"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
@@ -140,6 +141,56 @@ func TestServer_HandleListModels_Aliases(t *testing.T) {
 	}
 	if !ids["real"] || !ids["nick"] {
 		t.Errorf("expected alias entry; got %v", ids)
+	}
+}
+
+func TestServer_HandleListModels_Status(t *testing.T) {
+	local := newStubRouter(nil, "")
+	local.running = map[string]process.ProcessState{"loaded-model": process.StateReady}
+	s := newTestServer(local)
+	s.cfg = config.Config{
+		IncludeAliasesInList: true,
+		Models: map[string]config.ModelConfig{
+			"loaded-model":   {Aliases: []string{"loaded-alias"}},
+			"unloaded-model": {},
+		},
+	}
+	s.discovery = discovery.NewManager(s.cfg, s.proxylog, nil, nil)
+	s.discovery.SetPlanForTest(discovery.RoutePlan{
+		Listings: []discovery.Listing{{
+			ID:              "remote-model",
+			PeerID:          "peer1",
+			UpstreamModelID: "remote-model",
+			Discovered:      true,
+		}},
+	})
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	var resp struct {
+		Data []modelRecord `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	statuses := map[string]string{}
+	for _, m := range resp.Data {
+		statuses[m.ID], _ = m.Status["value"].(string)
+	}
+
+	if statuses["loaded-model"] != "loaded" {
+		t.Errorf("loaded-model status = %q, want loaded", statuses["loaded-model"])
+	}
+	if statuses["loaded-alias"] != "loaded" {
+		t.Errorf("loaded-alias status = %q, want loaded", statuses["loaded-alias"])
+	}
+	if statuses["unloaded-model"] != "unloaded" {
+		t.Errorf("unloaded-model status = %q, want unloaded", statuses["unloaded-model"])
+	}
+	if statuses["remote-model"] != "unloaded" {
+		t.Errorf("remote-model status = %q, want unloaded", statuses["remote-model"])
 	}
 }
 
@@ -531,6 +582,55 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 		}
 		if _, ok := meta["context_length"]; !ok {
 			t.Error("context_length should be preserved in metadata when caps is empty")
+		}
+	})
+}
+
+// TestServer_ModelStatus_Capabilities verifies the /api/events modelStatus
+// payload carries capability booleans and context_length for configured models.
+// The Models list reads both from this SSE payload.
+func TestServer_ModelStatus_Capabilities(t *testing.T) {
+	newServer := func(mc config.ModelConfig) *Server {
+		s := newTestServer(newStubRouter(nil, ""))
+		s.cfg = config.Config{Models: map[string]config.ModelConfig{"m": mc}}
+		return s
+	}
+
+	t.Run("renders capabilities and context", func(t *testing.T) {
+		s := newServer(config.ModelConfig{
+			Capabilities: config.ModelCapConfig{
+				In:      []string{"text", "image"},
+				Tools:   true,
+				Context: 128000,
+			},
+		})
+		status := s.modelStatus()
+		if len(status) != 1 {
+			t.Fatalf("expected 1 model, got %d", len(status))
+		}
+		m := status[0]
+		if m.Id != "m" {
+			t.Errorf("id = %q, want m", m.Id)
+		}
+		if m.Capabilities == nil || m.Capabilities["vision"] != true {
+			t.Errorf("vision = %v", m.Capabilities)
+		}
+		if m.Capabilities["function_calling"] != true {
+			t.Errorf("function_calling = %v", m.Capabilities["function_calling"])
+		}
+		if m.ContextLength != 128000 {
+			t.Errorf("context_length = %d, want 128000", m.ContextLength)
+		}
+	})
+
+	t.Run("omits capabilities when empty", func(t *testing.T) {
+		s := newServer(config.ModelConfig{})
+		m := s.modelStatus()[0]
+		if m.Capabilities != nil {
+			t.Errorf("expected no capabilities, got %v", m.Capabilities)
+		}
+		if m.ContextLength != 0 {
+			t.Errorf("expected no context_length, got %d", m.ContextLength)
 		}
 	})
 }

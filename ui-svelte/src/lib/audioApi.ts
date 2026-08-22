@@ -1,3 +1,4 @@
+import { authFetch } from "../stores/auth";
 import type { AudioTranscriptionResponse } from "./types";
 
 export async function transcribeAudio(
@@ -9,7 +10,7 @@ export async function transcribeAudio(
   formData.append("file", file);
   formData.append("model", model);
 
-  const response = await fetch("/v1/audio/transcriptions", {
+  const response = await authFetch("/v1/audio/transcriptions", {
     method: "POST",
     body: formData,
     signal,

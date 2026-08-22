@@ -1,5 +1,7 @@
 <script lang="ts">
   import { persistentStore } from "../stores/persistent";
+  import { isDarkMode } from "../stores/theme";
+  import { ansiToHtml } from "../lib/ansi";
 
   interface Props {
     id: string;
@@ -63,6 +65,8 @@
       return logData;
     }
   });
+
+  let renderedLogs = $derived(ansiToHtml(filteredLogs, $isDarkMode));
 
   let preElement: HTMLPreElement;
   let userScrolledUp = $state(false);
@@ -134,6 +138,6 @@
     {/if}
   </div>
   <div class="rounded-lg bg-background font-mono text-sm flex-1 overflow-hidden">
-    <pre bind:this={preElement} onscroll={handleScroll} class="{textWrapClass} {fontSizeClass} h-full overflow-auto p-4">{filteredLogs}</pre>
+    <pre bind:this={preElement} onscroll={handleScroll} class="{textWrapClass} {fontSizeClass} h-full overflow-auto p-4">{@html renderedLogs}</pre>
   </div>
 </div>

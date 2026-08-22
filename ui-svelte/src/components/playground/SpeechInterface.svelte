@@ -1,5 +1,6 @@
 <script lang="ts">
   import { models } from "../../stores/api";
+  import { authFetch } from "../../stores/auth";
   import { persistentStore } from "../../stores/persistent";
   import { generateSpeech } from "../../lib/speechApi";
   import { playgroundStores } from "../../stores/playgroundActivity";
@@ -72,7 +73,7 @@
     isLoadingVoices = true;
 
     try {
-      const response = await fetch(`/v1/audio/voices?model=${encodeURIComponent(model)}`);
+      const response = await authFetch(`/v1/audio/voices?model=${encodeURIComponent(model)}`);
       if (!response.ok) {
         // Fall back to default voices if API call fails
         availableVoices = defaultVoices;
